@@ -1,0 +1,60 @@
+# robot_localization EKF — VESC 휠속도 + IMU 융합
+#
+# 무엇을 어디서 믿는가 (F1TENTH 평면 주행 전제)
+#   VESC /odom      : vx 만            ← 휠 각속도는 슬립으로 못 믿는다
+#   IMU  /imu/data  : wz, ax 만        ← roll/pitch/z 는 평면이라 무시
+#
+# ★ imu_odom 과의 관계
+#   imu_odom 은 "yaw 만 자이로로 갈아끼우는" 최소 구성이다. EKF 는 여기에
+#   가속도까지 물려 vx 를 보정한다 — 휠이 헛돌 때 IMU 가 "실제로는 그만큼 가속
+#   안 했다" 고 잡아준다. 그 차이가 곧 슬립량이므로, EKF 를 붙이는 것 자체가
+#   슬립 데이터를 모으는 계측이 된다.
+#
+#   둘을 동시에 TF 발행시키면 안 된다. EKF 를 쓸 때는
+#   imu_odom 의 publish_tf 를 끄고 EKF 가 odom→base_link 를 내도록 한다.
+
+ekf_filter_node:
+  ros__parameters:
+    frequency: 50.0
+    sensor_timeout: 0.2
+    two_d_mode: true              # 평면 주행 — z/roll/pitch 를 0 으로 고정
+    publish_tf: true              # odom → base_link
+    print_diagnostics: true
+
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom             # odom 기준 = 지역 추정 (map 은 AMCL/SynPF 담당)
+
+    # ── VESC 휠 오도메트리 ────────────────────────────────────────────
+    # 순서: x y z / roll pitch yaw / vx vy vz / vroll vpitch vyaw / ax ay az
+    odom0: /odom
+    odom0_config: [false, false, false,
+                   false, false, false,
+                   true,  false, false,     # vx 만
+                   false, false, false,
+                   false, false, false]
+    odom0_differential: false
+    odom0_relative: false
+    odom0_queue_size: 10
+
+    # ── IMU (VESC 6 MK6 HP) ───────────────────────────────────────────
+    # ★ 원시 토픽 /sensors/imu/raw 은 단위가 g / deg-s 라 REP-145 가 아니다.
+    #   imu_odom 이 rad/s·m/s² 로 바꿔 /imu/data 로 다시 낸다. 그걸 쓴다.
+    imu0: /imu/data
+    imu0_config: [false, false, false,
+                  false, false, false,
+                  false, false, false,
+                  false, false, true,       # wz (yaw rate)
+                  true,  false, false]      # ax
+    imu0_differential: false
+    imu0_relative: false
+    imu0_remove_gravity_acceleration: true
+    imu0_queue_size: 20
+
+    # ── 프로세스 노이즈 ───────────────────────────────────────────────
+    # 대각만 쓴다. vx·yaw·vyaw 를 상대적으로 크게 둬 센서를 더 믿게 한다.
+    # 기본값에서 출발해 실주행 잔차(localization_monitor)를 보고 조인다.
+    process_noise_covariance: [0.05, 0.05, 0.06, 0.03, 0.03, 0.06,
+                               0.025, 0.025, 0.04, 0.01, 0.01, 0.02,
+                               0.01, 0.01, 0.015]

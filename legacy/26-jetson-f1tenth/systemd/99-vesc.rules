@@ -1,0 +1,12 @@
+# /etc/udev/rules.d/99-vesc.rules
+# VESC를 부팅 시 자동으로 /dev/sensors/vesc 로 심링크 (sudo ln 매번 안 해도 됨)
+#
+# 설치:
+#   sudo cp 99-vesc.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# 확인: ls -l /dev/sensors/vesc
+#
+# ※ idVendor/idProduct는 `lsusb`로 실제 VESC 값 확인 후 수정.
+#   (VESC 기본값은 보통 0483:5740 - STMicroelectronics Virtual COM Port)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="5740", SYMLINK+="sensors/vesc", MODE="0666"

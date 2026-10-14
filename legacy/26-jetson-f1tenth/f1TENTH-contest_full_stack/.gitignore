@@ -1,0 +1,18 @@
+# ROS2 colcon 빌드 산출물
+**/build/
+**/install/
+**/log/
+
+# 개인 기록 폴더
+forme/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 에디터
+.vscode/
+.idea/
+*.swp
+*.swo

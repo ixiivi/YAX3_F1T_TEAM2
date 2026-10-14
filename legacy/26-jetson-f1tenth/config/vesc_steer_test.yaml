@@ -1,0 +1,76 @@
+# ============================================================
+#  vesc_steer_test.yaml  —  ★ 조향 기구 한계 실측 전용. 주행 금지 ★
+#
+#  config/vesc.yaml 에서 servo_min/servo_max 만 0.02/0.98 로 넓힌 사본.
+#  vesc_driver 가 명령을 servo_min/max 로 먼저 잘라내기 때문에
+#  (vesc_driver.cpp:334), 원본 값(0.15/0.85)으로는 그 지점에서 바퀴가
+#  멈추는 것이 기구 스토퍼인지 소프트웨어 클램프인지 구분할 수 없다.
+#
+#  ★ 이 파일로 주행하지 말 것 — 정상 주행 중에도 서보가 스토퍼를 밀 수 있다.
+#    steer_limit_check.py 로 한 칸씩 재는 용도로만, 바퀴를 띄운 상태에서.
+#  ★ 측정이 끝나면 이 파일은 지워도 된다. 원본 config/vesc.yaml 은 그대로다.
+# ============================================================
+/**:
+  # general parameters shared by all vesc-related nodes
+  ros__parameters:
+    # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
+    speed_to_erpm_gain: 4614.0
+    speed_to_erpm_offset: 0.0
+
+    # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
+    # 2026-07-16 IMU 호주행 캘리브레이션: 실제 = 1.594×명령 + 0.032 (구 -1.2135/0.40)
+    #   좌 기구락 servo 0.15 = 0.361rad, 우 락 0.85 = 0.558rad → max_steer ≤ 0.35 권장
+    steering_angle_to_servo_gain: -0.761
+    steering_angle_to_servo_offset: 0.425
+
+    port: /dev/sensors/vesc
+    duty_cycle_min: 0.0
+    duty_cycle_max: 0.0
+    current_min: 0.0
+    current_max: 100.0
+    brake_min: -20000.0
+    brake_max: 200000.0
+    speed_min: -50000.0
+    speed_max: 50000.0
+    position_min: 0.0
+    position_max: 0.0
+    servo_min: 0.02
+    servo_max: 0.98
+
+# No longer needed, all parameters are shared
+# ackermann_to_vesc_node:
+#   ros__parameters:
+
+vesc_to_odom_node:
+  ros__parameters:
+    odom_frame: odom
+    base_frame: base_link
+    # ★ 2026-08-03: odom→base_link TF 발행을 race_stack 의 imu_odom 노드로 넘겼다.
+    #   AMCL·slam_toolbox 는 /odom 토픽이 아니라 이 TF 를 본다. 여기서 true 로 두면
+    #   같은 transform 을 두 노드가 발행해 TF 트리가 깨진다 (둘이 번갈아 이겨서
+    #   위치가 튄다). imu_odom 은 이 노드의 /odom 을 받아 yaw 만 자이로로 바꿔
+    #   다시 발행한다.
+    #   ※ 이 값이 false 인 상태에서 imu_odom 없이 bringup 만 띄우면 odom TF 가
+    #     아예 없다. race.launch.py / mapping.launch.py 는 항상 같이 띄운다.
+    publish_tf: false
+    use_servo_cmd_to_calc_angular_velocity: true
+    # measured axle-to-axle on this car: 33cm
+    wheelbase: 0.33
+
+# No longer needed, all parameters are shared
+# vesc_driver:
+#   ros__parameters:
+
+throttle_interpolator:
+  ros__parameters:
+    rpm_input_topic: commands/motor/unsmoothed_speed
+    rpm_output_topic: commands/motor/speed
+    servo_input_topic: commands/servo/unsmoothed_position
+    servo_output_topic: commands/servo/position
+
+    # servo smoother - limits acceleration and smooths anything above limit
+    max_acceleration: 2.5 # meters/second^2
+    throttle_smoother_rate: 75.0 # messages/sec
+    # servo smoother - limits rotation speed and smooths anything above limit
+    max_servo_speed: 3.2 # radians/second
+    servo_smoother_rate: 75.0 # messages/sec

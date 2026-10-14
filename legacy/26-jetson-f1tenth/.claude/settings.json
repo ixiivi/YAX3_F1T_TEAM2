@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/jetson/f1tenth_ws/src/f1tenth_system/f1tenth_stack/config/**)",
+      "Read(//home/jetson/f1tenth_ws/src/vesc/vesc_ackermann/src/**)",
+      "Bash(grep -rn \"vesc\\\\|bringup\\\\|f1tenth_stack\" src/race_stack/launch/*.py | head -20; echo \"=== install copy offset ===\"; grep -n \"servo_offset\\\\|servo_gain\" /home/jetson/f1tenth_ws/install/f1tenth_stack/share/f1tenth_stack/config/vesc.yaml)",
+      "Read(//home/jetson/f1tenth_ws/install/f1tenth_stack/share/f1tenth_stack/config/**)",
+      "Bash(grep -n \"add_on_set_parameters\\\\|ParameterEventHandler\\\\|set_parameter\" /home/jetson/f1tenth_ws/src/vesc/vesc_ackermann/src/ackermann_to_vesc.cpp || echo \"→ 동적 파라미터 콜백 없음 \\(재시작 필요\\)\")",
+      "Read(//home/jetson/f1tenth_ws/**)",
+      "Bash(colcon build *)",
+      "Bash(grep -rn \"0.36\\\\|max_steer\\\\|steering\" README.md JETSON_COMMANDS.md 2>/dev/null | head -20; echo \"=== f1tenth_stack 원본 joy_teleop 설정 ===\"; grep -rn \"steering\\\\|axis\\\\|scale\" /home/jetson/f1tenth_ws/src/f1tenth_system/f1tenth_stack/config/joy_teleop.yaml 2>/dev/null | head -20)",
+      "Bash(echo \"=== 이 레포 ===\"; grep -rn \"wheelbase\" config/ src/ race_script.yaml 2>/dev/null; echo; echo \"=== f1tenth_ws \\(VESC/브링업\\) ===\"; grep -rn \"wheelbase\" /home/jetson/f1tenth_ws/src/ 2>/dev/null | grep -v \"\\\\.git\")",
+      "Read(//home/jetson/f1tenth_ws/src/**)",
+      "Bash(chmod +x /home/jetson/yax/yaw_check.py)",
+      "Read(//home/jetson/f1tenth_ws/src/f1tenth_system/f1tenth_stack/**)",
+      "Read(//home/jetson/f1tenth_ws/install/vesc_driver/lib/vesc_driver/**)",
+      "Read(//home/jetson/f1tenth_ws/src/vesc/vesc_driver/src/**)",
+      "Bash(grep -n -A12 \"setServo\\\\|servo_min\\\\|servo_max\" /home/jetson/f1tenth_ws/src/vesc/vesc_driver/src/vesc_driver.cpp | grep -n -B2 -A8 \"servoCallback\\\\|clip\\\\|clamp\\\\|servo_limit\" | head -30)",
+      "Read(//home/jetson/**)",
+      "Read(//etc/profile.d/**)",
+      "Bash(env)",
+      "Bash(ros2 doctor *)",
+      "Read(//dev/shm/**)",
+      "Read(//home/jetson/.ros/**)",
+      "Bash(bash -n /home/jetson/yax/race.sh)",
+      "Bash(grep -iE \"install|deploy|setup|sync|\\\\.sh$\")",
+      "Bash(find /home/jetson/yax -name \"JETSON_COMMANDS.md\" 2>/dev/null; find /home/jetson -maxdepth 2 -name \"JETSON_COMMANDS.md\" 2>/dev/null)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'chore: Claude Code 허용 명령 목록 갱신 *)",
+      "Bash(git push *)",
+      "Read(//home/jetson/f1tenth_ws/install/race_stack/share/race_stack/maps/**)",
+      "Read(//home/jetson/f1tenth_ws/install/race_stack/share/race_stack/waypoints/**)",
+      "Read(//home/jetson/f1tenth_ws/install/race_stack/share/race_stack/maps/track_2nd_clean/**)",
+      "Bash(grep -rn \"servo\" /home/jetson/f1tenth_ws/src/vesc/vesc_ackermann/src/vesc_to_odom.cpp 2>/dev/null | head; ls /home/jetson/f1tenth_ws/src/vesc/vesc_ackermann/src/ 2>/dev/null)",
+      "Bash(sed -n 95,135p /home/jetson/f1tenth_ws/src/vesc/vesc_ackermann/src/vesc_to_odom.cpp)",
+      "Bash(python3 -m py_compile /home/jetson/yax/src/race_stack/race_stack/stanley_controller.py /home/jetson/yax/src/race_stack/race_stack/pure_pursuit.py)",
+      "Bash(bash -c 'SCRIPT_DIR=\"$\\(cd \"$\\(dirname \"./race.sh\"\\)\" && pwd\\)\"; echo \"SCRIPT_DIR=$SCRIPT_DIR\"; echo \"RACE_SCRIPT=$SCRIPT_DIR/race_script.yaml\"; ls -la \"$SCRIPT_DIR/race_script.yaml\" 2>&1')",
+      "Bash(chmod +x /home/jetson/yax/plot_waypoints.py)",
+      "Bash(python3 /home/jetson/yax/plot_waypoints.py)",
+      "Bash(python3 -c \"from PIL import Image; print\\('png:', Image.open\\('/home/jetson/yax/src/race_stack/maps/track_2nd_clean.png'\\).size\\); print\\('pgm:', Image.open\\('/home/jetson/yax/src/race_stack/maps/track_2nd_clean.pgm'\\).size\\)\")"
+    ],
+    "additionalDirectories": [
+      "/home/jetson/f1tenth_ws/src/f1tenth_system/f1tenth_stack/config"
+    ]
+  }
+}

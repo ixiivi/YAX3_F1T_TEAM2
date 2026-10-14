@@ -1,0 +1,45 @@
+mode: q3
+map_name: my_track
+waypoints: my_track_wp
+controller: pure_pursuit
+speed:
+  q1_max: 2.8
+  q2_max: 1.8
+  q3_max: 4.2
+  race_max: 2.6
+  mapping_max: 0.45
+  min_speed: 1.0
+pure_pursuit:
+  lookahead: 2.0
+  lookahead_speed_gain: 0.32
+  wheelbase: 0.33
+  max_steer: 0.36
+  curvature_slowdown: 1.25
+gap_follower:
+  car_width: 0.42
+  disparity_threshold: 0.35
+  max_range: 8.0
+  fov_deg: 180.0
+  steer_gain: 0.75
+  speed_gain: 0.45
+mission:
+  laps: 0
+  time_limit_sec: 120
+  start_x: 0.0
+  start_y: 0.0
+  start_radius: 1.2
+safety:
+  enabled: true
+  ttc_threshold: 0.50
+  hold_sec: 0.6
+localization:
+  init_x: 0.0
+  init_y: 0.0
+  init_yaw: 0.0
+q2_hybrid:
+  max_speed: 1.8
+  min_speed: 0.8
+  follow_side: right
+  desired_distance: 1.0
+final_1v1:
+  params_file: race_1v1_params.yaml

@@ -1,0 +1,17 @@
+joy:
+  ros__parameters:
+    device_id: 0
+    deadzone: 0.05
+    autorepeat_rate: 20.0
+joy_teleop:
+  ros__parameters:
+    human_control:
+      type: topic
+      interface_type: ackermann_msgs/msg/AckermannDriveStamped
+      topic_name: teleop
+      deadman_buttons: [4]
+      axis_mappings:
+        # Logitech F710 (Mode OFF): ROS trigger is +1 released, -1 pressed.
+        # This maps RT linearly to 0.0..1.0 m/s while LB is held.
+        drive-speed: {axis: 5, scale: -0.5, offset: 0.5}
+        drive-steering_angle: {axis: 0, scale: 0.34, offset: 0.0}
