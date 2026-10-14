@@ -1,0 +1,24 @@
+slam_toolbox:
+  ros__parameters:
+    # SLAM 기본 설정
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+
+    # LiDAR 토픽 
+    scan_topic: /scan
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+
+    # 지도 업데이트 주기
+    map_update_interval: 0.5
+
+    # 지도 해상도 
+    resolution: 0.05
+
+    # 최대 지도 크기
+    max_laser_range: 20.0
+
+    use_scan_matching: true
+    use_scan_barycenter: true

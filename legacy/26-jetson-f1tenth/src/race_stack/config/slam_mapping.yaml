@@ -1,0 +1,126 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  slam_mapping.yaml — 매핑용 slam_toolbox 파라미터 (race_stack 소유)
+#
+#  원본은 f1tenth_stack/config/f1tenth_online_async.yaml 이었다. 그 파일은
+#  f1tenth_stack 소유라 **두 차가 공유**하고 우리가 고치면 업스트림 갱신 때
+#  덮인다. 그래서 race_stack 으로 복사해 여기서 튜닝한다.
+#  되돌리려면 mapping.launch.py 의 slam_params 를 원래 경로로 되돌리면 된다.
+#
+#  ─ 왜 고쳤나 (2026-08-10) ────────────────────────────────────────────
+#  2호차 맵이 닫히지 않고 같은 복도가 두 겹으로 겹쳐 그려졌다. 기본값은
+#  넓은 실내를 빠르게 도는 것을 전제로 잡혀 있어서, 우리처럼 **좁고 짧은
+#  트랙을 저속으로 도는** 경우엔 스캔이 너무 성기게 쌓이고 루프 후보를
+#  못 찾는다. 아래 ★ 표시가 기본값에서 바꾼 항목이다.
+#
+#  ⚠ 이 파일은 **매핑 전용**이다. 주행 중 위치추정은 AMCL 이 한다.
+# ═══════════════════════════════════════════════════════════════════════
+slam_toolbox:
+  ros__parameters:
+
+    # ── 솔버 ────────────────────────────────────────────────────────
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    # ── 프레임 ──────────────────────────────────────────────────────
+    #   odom TF 는 imu_odom 이 낸다 (vesc.yaml 에서 vesc_to_odom.publish_tf:false).
+    #   그래서 **imu_odom 이 안 뜨면 SLAM 이 통째로 멈춘다.**
+    odom_frame: odom
+    map_frame: map
+    base_frame: laser
+    scan_topic: /scan
+    mode: mapping
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+    map_update_interval: 5.0
+    resolution: 0.05
+
+    # ★ 20.0 → 12.0
+    #   우리 LiDAR(UST-10LX 계열) 실측 최대 유효거리가 약 11.95m 다. 그보다 큰
+    #   값을 주면 존재하지 않는 원거리 빔까지 래스터에 넣어 맵이 지저분해지고,
+    #   먼 빔은 입사각이 누워 매칭 정확도를 떨어뜨린다.
+    max_laser_range: 12.0
+
+    # ★ 0.5 → 0.2
+    #   스캔을 얼마나 자주 그래프에 넣을지의 시간 하한. 저속(≤1㎧)으로 돌면
+    #   0.5s 간격은 너무 성기다 — 아래 travel 조건과 함께 스캔 밀도를 올린다.
+    minimum_time_interval: 0.2
+
+    transform_timeout: 1.0
+    tf_buffer_duration: 30.
+    stack_size_to_use: 40000000
+    enable_interactive_mode: true
+
+    # ── 스캔 매칭 (= 오도메트리 + 라이다 융합이 일어나는 곳) ──────────
+    #   ★ 별도의 융합 노드가 필요한 게 아니다. slam_toolbox 는
+    #     odom TF 를 **초기 추정**으로 받아 그 주변에서 스캔을 맞춰
+    #     보정한다. 즉 여기가 이미 융합이다. odom 이 틀리면(예: 부호 반전)
+    #     초기 추정이 엉뚱해져 매칭이 실패하므로, odom 부호부터 맞아야 한다.
+    use_scan_matching: true
+    use_scan_barycenter: true
+
+    # ★ 0.5 → 0.2 / 0.5 → 0.25
+    #   이만큼 움직이거나 돌아야 스캔을 새로 넣는다. 기본값이면 짧은 트랙에서
+    #   한 바퀴에 수십 장밖에 안 쌓여 루프 체인 조건(아래)을 못 채운다.
+    #   촘촘할수록 매칭·루프 클로징이 잘 되지만 CPU 와 맵 파일이 커진다.
+    #   젯슨 오린에서 이 정도는 여유롭다.
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.25
+
+    # ★ 10 → 25
+    #   현재 스캔을 맞출 때 참고하는 최근 스캔 개수. 스캔이 촘촘해진 만큼
+    #   같은 물리 거리를 보려면 개수를 늘려야 한다.
+    scan_buffer_size: 25
+    scan_buffer_maximum_scan_distance: 10.0
+
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+
+    # ── 루프 클로징 ─────────────────────────────────────────────────
+    do_loop_closing: true
+
+    # ★ 3.0 → 8.0  (가장 중요한 변경)
+    #   "추정 위치에서 이 반경 안" 에서만 닫을 후보를 찾는다. 한 바퀴 돌아왔을 때
+    #   누적 드리프트가 3m 를 넘으면 후보를 아예 못 찾아 **루프 클로징이 한 번도
+    #   발동하지 않는다.** 겹쳐 그려진 맵이 정확히 그 증상이다.
+    #   너무 키우면 비슷하게 생긴 다른 구간과 잘못 닫아 맵이 접힌다. 8m 는
+    #   우리 트랙 크기(수십 m)에서 오검출과 회수율의 절충이다.
+    loop_search_maximum_distance: 8.0
+
+    # ★ 10 → 15
+    #   루프로 인정하려면 연속 스캔이 이만큼 필요하다. 스캔이 촘촘해졌으므로
+    #   개수를 올려야 예전과 비슷한 **물리적 길이**를 요구하게 된다.
+    #   (0.2m 간격 × 15 = 3m — 기본값의 0.5m × 10 = 5m 보다는 짧아 잘 걸린다)
+    loop_match_minimum_chain_size: 15
+
+    loop_match_maximum_variance_coarse: 3.0
+
+    # ★ 0.35 → 0.45 / 0.45 → 0.5
+    #   루프를 받아들이는 최소 일치도. 탐색 반경을 8m 로 넓혔으니 문턱도 같이
+    #   올려야 **거짓 루프**가 늘지 않는다. 이 둘은 반드시 같이 움직여야 한다.
+    loop_match_minimum_response_coarse: 0.45
+    loop_match_minimum_response_fine: 0.5
+
+    # ── 상관 탐색 ───────────────────────────────────────────────────
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.1
+
+    loop_search_space_dimension: 8.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # ── 스캔 매처 ───────────────────────────────────────────────────
+    distance_variance_penalty: 0.5
+    angle_variance_penalty: 1.0
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true

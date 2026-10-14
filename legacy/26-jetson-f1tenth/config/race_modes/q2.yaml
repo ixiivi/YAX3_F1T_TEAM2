@@ -1,0 +1,62 @@
+mode: q2
+map_name: my_track
+waypoints: my_track_wp
+controller: q2_hybrid
+speed:
+  q1_max: 2.8
+  q2_max: 1.8
+  q3_max: 4.0
+  race_max: 2.6
+  mapping_max: 0.45
+  min_speed: 0.8
+pure_pursuit:
+  lookahead: 1.5
+  lookahead_speed_gain: 0.2
+  wheelbase: 0.33
+  max_steer: 0.36
+  curvature_slowdown: 1.8
+gap_follower:
+  car_width: 0.42
+  disparity_threshold: 0.35
+  max_range: 8.0
+  fov_deg: 180.0
+  steer_gain: 0.75
+  speed_gain: 0.45
+mission:
+  laps: 3
+  time_limit_sec: 480
+  start_x: 0.0
+  start_y: 0.0
+  start_radius: 1.2
+safety:
+  enabled: true
+  ttc_threshold: 0.55
+  hold_sec: 0.8
+localization:
+  init_x: 0.0
+  init_y: 0.0
+  init_yaw: 0.0
+q2_hybrid:
+  max_speed: 1.8
+  min_speed: 0.8
+  max_steering: 0.36
+  kp: 0.8
+  ki: 0.0
+  kd: 0.3
+  desired_distance: 1.0
+  lookahead: 1.0
+  alpha_angle: 45.0
+  follow_side: right
+  bubble_radius: 0.35
+  max_lidar_dist: 5.0
+  disparity_threshold: 0.3
+  gap_fov_deg: 180.0
+  obstacle_detect_fov_deg: 70.0
+  obstacle_detect_range: 3.0
+  obstacle_min_pts: 3
+  obstacle_max_width: 0.8
+  cluster_gap: 0.25
+  mode_switch_cooldown: 1.5
+  control_rate: 20.0
+final_1v1:
+  params_file: race_1v1_params.yaml

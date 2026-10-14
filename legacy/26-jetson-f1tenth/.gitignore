@@ -1,0 +1,56 @@
+# ROS2 colcon 빌드 산출물
+**/build/
+**/install/
+**/log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 에디터
+.vscode/
+.idea/
+*.sw[op]
+
+# Claude Code 로컬 전용 설정
+.claude/settings.local.json
+
+# Claude Code 스킬 (개인용, 팀 공유 안 함)
+.claude/skills/
+
+# Claude Code 대화 기록 (개인용, 팀 공유 안 함)
+chat_log/
+
+# tune.sh 로컬 상태 (튜닝 이력 · --undo 용 백업)
+.tune_history
+.tune_backup.yaml
+.tune_backup.json
+
+# 외부 최적화 도구 (로컬 클론)
+forza_traj_opt/
+global_racetrajectory_optimization/
+
+# ★★ 주행 bag 은 git 에 넣지 않는다 (2026-08-14).
+#   1ffd3df 가 주행 로그를 자동 커밋하려고 `logs/` 를 여기서 뺐는데, race.sh 의
+#   `git add logs/` 가 **bag 까지 통째로** 집는다. 실측:
+#       CSV·gains  8.7MB  (110 폴더)   ← 이건 올려야 한다. 사후 분석의 근거다
+#       bag        2.0GB  ( 64 폴더)   ← 230배. 한 번 커밋하면 영구히 박힌다
+#   팀 공유기도 아닌 공용 와이파이로 2GB 를 밀면 push 가 멎는다.
+#   bag 이 필요하면 그때 사람이 골라서 `git add -f` 로 넣을 것.
+logs/bags/
+#   slip 리그도 같은 이름 규약으로 bag 을 남긴다 (logs/slip_tests/bag_*).
+#   측정 결과인 *_friction.csv 는 작아서(수백 KB) 그대로 올린다.
+logs/slip_tests/bag_*/
+logs/curv_tests/bag_*/
+
+# sim.sh 자동 생성 심링크
+f1TENTH-contest_full_stack/sim_ws/src/f1tenth_gym_ros/maps/*_waypoints.csv
+
+# ★ 차량별 캘리브레이션 — 절대 커밋하지 않는다
+#   config/vesc.yaml 은 config/vesc_base.yaml + config/vehicle_<차>.yaml 에서
+#   apply_vehicle.py 가 매 실행마다 생성한다. git 에 두면 2호차의 음수
+#   speed_to_erpm_gain 이 1호차로 넘어가 차가 후진한다 — 추적 대상에서 뺀다.
+config/vesc.yaml
+config/.vehicle_overlay.yaml
+.car

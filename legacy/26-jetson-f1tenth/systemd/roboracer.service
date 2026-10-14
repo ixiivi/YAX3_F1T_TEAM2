@@ -1,0 +1,28 @@
+# /etc/systemd/system/roboracer.service
+# 부팅 시 race_script.yaml의 mode대로 자동 기동 (Fully Autonomous 대비)
+#
+# 설치:
+#   sudo cp roboracer.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable roboracer     # 부팅 자동 시작
+#   sudo systemctl start roboracer      # 지금 시작
+#   journalctl -u roboracer -f          # 로그 보기
+#
+# ※ User=jetson 은 실제 젯슨 계정명으로 수정할 것.
+# ※ 연습 때는 disable 해두고 수동으로 ./race.sh 쓰는 걸 추천.
+
+[Unit]
+Description=RoboRacer 2026 Race Stack
+After=network.target
+
+[Service]
+Type=simple
+User=jetson
+# /dev/sensors/vesc 심링크는 udev rule로 처리하는 게 정석 (README 참조).
+# race.sh 안의 sudo ln은 서비스 환경에선 실패하므로 udev rule 필수.
+ExecStart=/bin/bash -lc "cd /home/jetson/race_stack_skeleton && ./race.sh"
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

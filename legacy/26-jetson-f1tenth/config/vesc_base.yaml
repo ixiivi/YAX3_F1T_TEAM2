@@ -1,0 +1,77 @@
+# vesc_base.yaml — VESC 배관 설정 (두 차량 공용)
+#
+# ★ 차량별 캘리브레이션은 여기 없다. config/vehicle_<차>.yaml 에 있고,
+#   config/apply_vehicle.py 가 이 파일의 __자리표시자__ 를 채워
+#   config/vesc.yaml 을 만든다. 그 파일은 .gitignore 라 **잘못 커밋할 방법이
+#   없다** — 2호차는 모터 결선이 반대라 speed_to_erpm_gain 이 음수인데,
+#   그 값이 1호차로 넘어가면 그대로 후진한다.
+#
+#   자리표시자 6개: erpm 게인 / 조향 게인·중립 / servo_min·max / 휠베이스
+#   (정확한 토큰 이름은 apply_vehicle.py 의 VESC_KEYS 를 볼 것 — 여기 그대로
+#    적으면 생성할 때 이 주석까지 치환된다)
+#
+#   여기 있는 값(포트·스무더·전류/브레이크 리밋)을 고치면 두 차에 다 적용된다.
+
+/**:
+  # general parameters shared by all vesc-related nodes
+  ros__parameters:
+    # erpm = speed_to_erpm_gain × speed[m/s] + speed_to_erpm_offset
+    #   부호와 크기 모두 차량별이다:
+    #     부호 — 모터 결선 방향. 양수 지령이 후진이면 음수로 둔다
+    #     크기 — 기어비·타이어 지름. 줄자로 재라 (ros2 run race_stack odom_scale)
+    #   ★ 이 게인은 지령과 오도메트리 **양쪽**에 쓰인다. 틀리면 자율주행이
+    #     반대로 가는 것에 그치지 않고 SLAM 맵까지 깨진다 (2026-08-09 2호차).
+    speed_to_erpm_gain: __SPEED_TO_ERPM_GAIN__
+    speed_to_erpm_offset: 0.0
+
+    # servo(0~1) = steering_angle_to_servo_gain × 조향각[rad] + offset
+    #   gain   — 링키지 비. IMU 호주행 캘리브레이션으로 잰다
+    #   offset — 직진 중립. steer_trim 으로 잰다
+    steering_angle_to_servo_gain: __STEERING_ANGLE_TO_SERVO_GAIN__
+    steering_angle_to_servo_offset: __STEERING_ANGLE_TO_SERVO_OFFSET__
+
+    port: /dev/sensors/vesc
+    duty_cycle_min: 0.0
+    duty_cycle_max: 0.0
+    current_min: 0.0
+    current_max: 100.0
+    brake_min: -20000.0
+    brake_max: 200000.0
+    speed_min: -50000.0
+    speed_max: 50000.0
+    position_min: 0.0
+    position_max: 0.0
+
+    # 서보 소프트 리밋. vesc_driver.cpp:334 가 조향 명령을 이 범위로 **먼저**
+    # 자른다 — 기구 스토퍼를 직접 밀지 않으려는 안전선이다.
+    #   ★ 이 값과 offset/gain 이 실제 최대 조향각을 정한다:
+    #        δ = (servo_min − offset) / (−gain)
+    #     그래서 race_script 의 max_steer 는 **손으로 적지 않는다.**
+    #     apply_vehicle.py 가 계산해서 내려보낸다. 2026-08-09 에 offset 만
+    #     바뀌고 max_steer 가 안 따라와 좌 조향 지령의 25.8% 가 조용히
+    #     잘려나간 적이 있다.
+    #   ★ 기구 스토퍼는 config/vesc_steer_test.yaml 로 락을 풀고 실측할 것.
+    #     스토퍼를 밀면 스톨 전류로 서보가 탄다.
+    servo_min: __SERVO_MIN__
+    servo_max: __SERVO_MAX__
+
+vesc_to_odom_node:
+  ros__parameters:
+    odom_frame: odom
+    base_frame: base_link
+    # ★ false 다. odom→base_link TF 는 race_stack 의 imu_odom 노드가 발행한다
+    #   (VESC 자이로로 각속도를 대체). 둘 다 켜면 TF 가 충돌한다.
+    publish_tf: false
+    use_servo_cmd_to_calc_angular_velocity: true
+    wheelbase: __WHEELBASE__
+
+throttle_interpolator:
+  ros__parameters:
+    rpm_input_topic: commands/motor/unsmoothed_speed
+    rpm_output_topic: commands/motor/speed
+    servo_input_topic: commands/servo/unsmoothed_position
+    servo_output_topic: commands/servo/position
+    max_acceleration: 2.5           # m/s²
+    throttle_smoother_rate: 75.0    # messages/sec
+    max_servo_speed: 3.2            # rad/s
+    servo_smoother_rate: 75.0       # messages/sec

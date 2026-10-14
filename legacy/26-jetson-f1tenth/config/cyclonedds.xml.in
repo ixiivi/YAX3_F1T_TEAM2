@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  cyclonedds.xml.in — CycloneDDS 설정 템플릿
+
+  ★ 이 파일을 직접 쓰지 않는다. config/dds_env.sh 가 실행 시점에
+    아래 두 자리표시자(LOCAL_IP / PEERS)를 채워 /tmp 에 실제 XML 을 만들고
+    CYCLONEDDS_URI 로 가리킨다.
+    (주석에 자리표시자를 그대로 쓰면 치환 대상이 되어 XML 이 깨진다)
+    설정을 바꾸려면 race_script.yaml 의 network: 섹션을 수정할 것.
+
+  왜 CycloneDDS 인가 (기본 FastDDS 대신):
+    WiFi 에서 /map(67KB, TRANSIENT_LOCAL) 과 /tf_static(TRANSIENT_LOCAL) 의
+    "늦게 접속한 구독자에게 과거 1회 발행분 전달"이 자주 실패했다.
+    증상: ros2 topic list 에는 다 뜨는데 RViz 화면은 간헐적으로만 나옴.
+-->
+<CycloneDDS xmlns="https://cdds.io/config"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+            xsi:schemaLocation="https://cdds.io/config
+                                https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain Id="any">
+
+    <General>
+      <!-- 인터페이스를 IP 로 고정.
+           젯슨에는 주행망(192.168.50.x)과 LiDAR 전용망(192.168.0.x)이 동시에
+           올라와 있어서, 자동 선택에 맡기면 LiDAR 쪽을 잡아 노트북과 통신이
+           끊긴다. dds_env.sh 가 주행망 대역에서 자기 IP 를 찾아 채워 넣는다. -->
+      <Interfaces>
+        <NetworkInterface address="@LOCAL_IP@" priority="default" multicast="false"/>
+      </Interfaces>
+
+      <!-- 멀티캐스트 비활성화.
+           WiFi AP 는 멀티캐스트를 낮은 속도로 강등하거나 아예 막는 경우가 많다.
+           discovery 는 아래 Peers 의 유니캐스트로만 처리해 결정적으로 만든다. -->
+      <AllowMulticast>false</AllowMulticast>
+
+      <!-- 데이터그램을 MTU 아래로 유지한다.
+           크게 잡으면 IP 단편화가 일어나 조각 하나만 잃어도 데이터그램 전체가
+           버려진다(WiFi 에서 흔함). 작게 잡으면 Cyclone 이 RTPS 레벨에서
+           쪼개고, 잃은 조각만 NACK 으로 재전송된다 — 손실 환경에서 훨씬 강하다.
+           /map 67KB 가 정확히 이 경로를 탄다. -->
+      <MaxMessageSize>1400B</MaxMessageSize>
+      <FragmentSize>1344B</FragmentSize>
+    </General>
+
+    <Discovery>
+      <!-- 같은 호스트에서 여러 프로세스가 뜨므로 auto.
+           한 스택이 ~14개 노드를 띄우므로 여유를 크게 준다. 이 값이 모자라면
+           "Failed to find a free participant index for domain 0" 로 노드가
+           전부 죽는다. 고아 프로세스가 남아 인덱스를 쥐고 있을 때도 같은 증상이
+           나므로, 그때는 값을 올리기 전에 ./race.sh stop 으로 먼저 정리할 것. -->
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>60</MaxAutoParticipantIndex>
+      <!-- 유니캐스트 피어 목록 (race_script.yaml 의 network.peers).
+           IP 가 고정된 기기(보통 젯슨)만 있으면 된다. 상대가 먼저 인사해 오면
+           그 패킷에서 주소를 배우므로, IP 가 유동적인 노트북은 적지 않아도 된다. -->
+      <Peers>
+@PEERS@
+      </Peers>
+
+      <!-- 기본 30s 는 유니캐스트 전용에서 너무 느리다. RViz 를 켜고 붙기까지,
+           또는 한쪽이 재시작한 뒤 다시 만나기까지 그만큼 기다리게 된다. -->
+      <SPDPInterval>5s</SPDPInterval>
+    </Discovery>
+
+    <Internal>
+      <!-- 쓰기 히스토리 버퍼. TRANSIENT_LOCAL 래치 데이터가 재전송을 기다리는
+           동안 머무는 곳이라, 작으면 늦게 붙은 RViz 가 /map 을 못 받는다. -->
+      <Watermarks>
+        <WhcHigh>4MB</WhcHigh>
+      </Watermarks>
+      <!-- 재전송 응답을 조금 늦춰 NACK 폭주를 막는다 (무선에서 유효) -->
+      <NackDelay>10ms</NackDelay>
+      <RetransmitMerging>adaptive</RetransmitMerging>
+    </Internal>
+
+    <Tracing>
+      <!-- 문제 추적이 필요하면 Verbosity 를 config 나 fine 으로 올릴 것 -->
+      <Verbosity>warning</Verbosity>
+      <OutputFile>stderr</OutputFile>
+    </Tracing>
+
+  </Domain>
+</CycloneDDS>
