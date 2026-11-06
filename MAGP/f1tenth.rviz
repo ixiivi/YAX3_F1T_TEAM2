@@ -1,8 +1,4 @@
-Panels:
-  - Class: rviz_common/Displays
-    Name: Displays
-  - Class: rviz_common/Views
-    Name: Views
+Panels: []
 Visualization Manager:
   Class: ""
   Displays:
@@ -51,7 +47,7 @@ Visualization Manager:
     - Class: rviz_default_plugins/TF
       Name: TF
       Enabled: true
-      Marker Scale: 0.5
+      Marker Scale: 5
       Show Arrows: true
       Show Axes: true
       Show Names: true
@@ -174,9 +170,5 @@ Visualization Manager:
       Value: TopDownOrtho (rviz_default_plugins)
     Saved: ~
 Window Geometry:
-  Height: 900
-  Width: 1400
-  Displays:
-    collapsed: false
-  Views:
-    collapsed: true
+  Height: 962
+  Width: 930

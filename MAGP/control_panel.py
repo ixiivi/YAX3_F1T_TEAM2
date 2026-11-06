@@ -8,7 +8,9 @@ so they override autonomous /drive commands at any time.
 import glob
 import math
 import os
+import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -32,6 +34,8 @@ MAPS = os.path.join(WS, 'maps')
 WPS = os.path.join(WS, 'waypoints')
 SETUP = f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
 SLAM_PARAMS = f'{WS}/src/f1tenth_system/f1tenth_stack/config/f1tenth_online_async.yaml'
+LOG_LINES = 9
+FONT_SCALE = 0.63    # the desktop text scale is 2x, which is too large for half a screen
 ERPM_GAIN = 4614.0   # speed_to_erpm_gain in vesc.yaml
 REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
 # resting LiPo voltage per cell -> state of charge [%]
@@ -172,6 +176,12 @@ class RosLink:
         self.pp_cmd_pub.publish(String(data=cmd))
 
 
+def fixed_font():
+    f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+    f.setPointSizeF(f.pointSizeF() * FONT_SCALE)
+    return f
+
+
 def nofocus(w):
     # buttons must not take keyboard focus, otherwise space/WASD would press them
     w.setFocusPolicy(QtCore.Qt.NoFocus)
@@ -199,8 +209,8 @@ class Panel(QtWidgets.QWidget):
                            ('tool', '맵 저장/위치 찾기'), ('joy', '조이스틱')]:
             log = QtWidgets.QPlainTextEdit(readOnly=True)
             log.setMaximumBlockCount(3000)
-            log.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
-            log.setMinimumHeight(self.fontMetrics().height() * 3)
+            log.setFont(fixed_font())
+            log.setMinimumHeight(QtGui.QFontMetrics(fixed_font()).lineSpacing() * LOG_LINES + 8)
             nofocus(log)
             self.tabs.addTab(log, label)
             pr = Proc(label, log)
@@ -210,15 +220,20 @@ class Panel(QtWidgets.QWidget):
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(self._status_row())
         controls = QtWidgets.QWidget()
-        top = QtWidgets.QHBoxLayout(controls)
-        top.setContentsMargins(0, 0, 0, 0)
+        rows = QtWidgets.QVBoxLayout(controls)
+        rows.setContentsMargins(0, 0, 0, 0)
+        top = QtWidgets.QHBoxLayout()
         left = QtWidgets.QVBoxLayout()
         left.addWidget(self._run_box())
         left.addWidget(self._map_box())
         left.addStretch(1)
         top.addLayout(left)
         top.addWidget(self._auto_box())
-        top.addWidget(self._manual_box())
+        rows.addLayout(top)
+        rows.addWidget(self._manual_box())
+        for box in controls.findChildren(QtWidgets.QGroupBox):
+            box.layout().setContentsMargins(8, 2, 8, 2)
+            box.layout().setSpacing(2)
         # on a small screen the controls scroll; E-STOP stays outside so it is always visible
         self.scroll = nofocus(QtWidgets.QScrollArea(widgetResizable=True))
         self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -261,8 +276,15 @@ class Panel(QtWidgets.QWidget):
         b = nofocus(QtWidgets.QPushButton(text))
         b.clicked.connect(slot)
         if color:
-            b.setStyleSheet(f'background:{color}; color:white; font-weight:bold; padding:6px')
+            b.setStyleSheet(f'background:{color}; color:white; font-weight:bold')
         return b
+
+    def _combo(self):
+        # size to a short name, so one long file name cannot widen the whole panel
+        c = nofocus(QtWidgets.QComboBox())
+        c.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        c.setMinimumContentsLength(8)
+        return c
 
     def _run_box(self):
         box = QtWidgets.QGroupBox('실행')
@@ -277,12 +299,13 @@ class Panel(QtWidgets.QWidget):
             b = self._button('켜기', lambda _=False, k=key: self.toggle(k))
             self.run_btn[key] = b
             g.addWidget(b, r, 1)
+        g.setColumnStretch(0, 1)   # spare width goes to the labels, not the buttons
         return box
 
     def _map_box(self):
         box = QtWidgets.QGroupBox('맵')
         g = QtWidgets.QGridLayout(box)
-        self.map_cb = nofocus(QtWidgets.QComboBox())
+        self.map_cb = self._combo()
         self.map_cb.currentIndexChanged.connect(self.map_changed)
         g.addWidget(QtWidgets.QLabel('맵'), 0, 0)
         g.addWidget(self.map_cb, 0, 1, 1, 2)
@@ -297,7 +320,7 @@ class Panel(QtWidgets.QWidget):
     def _auto_box(self):
         box = QtWidgets.QGroupBox('자율주행')
         g = QtWidgets.QGridLayout(box)
-        self.wp_cb = nofocus(QtWidgets.QComboBox())
+        self.wp_cb = self._combo()
         g.addWidget(QtWidgets.QLabel('웨이포인트'), 0, 0)
         g.addWidget(self.wp_cb, 0, 1, 1, 3)
         g.addWidget(QtWidgets.QLabel('최고 속도 [m/s]'), 1, 0)
@@ -328,47 +351,67 @@ class Panel(QtWidgets.QWidget):
 
     def _manual_box(self):
         box = QtWidgets.QGroupBox('수동 주행')
-        v = QtWidgets.QVBoxLayout(box)
+        row = QtWidgets.QHBoxLayout(box)
+        v = QtWidgets.QVBoxLayout()
         self.manual_btn = self._button('키보드 조종 켜기', self.toggle_manual)
+        self.manual_btn.setToolTip('W/S 속도 ±   A/D 조향   X 조향 중앙\n'
+                                   'Space 감속 정지   B 즉시 정지\n'
+                                   '키 한 번 = 한 단계, 꾹 눌러도 한 번')
         v.addWidget(self.manual_btn)
         self.manual_label = QtWidgets.QLabel('꺼짐')
-        self.manual_label.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+        self.manual_label.setFont(fixed_font())
         v.addWidget(self.manual_label)
-        v.addWidget(QtWidgets.QLabel('W/S 속도 ±   A/D 조향   X 조향 중앙\n'
-                                     'Space 감속 정지   B 즉시 정지\n'
-                                     '(키 한 번 = 한 단계, 꾹 눌러도 한 번)'))
+        v.addStretch(1)
+        row.addLayout(v, 1)
+        v = QtWidgets.QVBoxLayout()
         self.joy_btn = self._button('조이스틱 조종 켜기', self.toggle_joy)
+        self.joy_btn.setToolTip('RB 누른 채 RT 가속, 왼쪽 스틱 조향\n'
+                                'LB 자율주행 허용   둘 다 놓으면 정지')
         v.addWidget(self.joy_btn)
         self.joy_label = QtWidgets.QLabel('꺼짐')
         v.addWidget(self.joy_label)
-        v.addWidget(QtWidgets.QLabel('RB 누른 채 RT 가속, 왼쪽 스틱 조향\nLB 자율주행 허용   둘 다 놓으면 정지'))
         v.addStretch(1)
+        row.addLayout(v, 1)
         return box
 
     def _estop_button(self):
         self.estop_btn = self._button('긴급 정지', self.toggle_estop, '#c62828')
-        self.estop_btn.setMinimumHeight(70)
+        self.estop_btn.setMinimumHeight(44)
         f = self.estop_btn.font()
-        f.setPointSize(f.pointSize() + 6)
+        f.setPointSize(f.pointSize() + 3)
         self.estop_btn.setFont(f)
         return self.estop_btn
 
+    def place_rviz(self, tries=20):
+        """Move RViz to the right half. It ignores -geometry, so find its window once it opens."""
+        out = subprocess.run(['xwininfo', '-root', '-tree'],
+                             capture_output=True, text=True, check=False).stdout
+        found = re.search(r'(0x[0-9a-f]+) "[^"]*RViz[^"]*": \("rviz2"', out)
+        if found:
+            # wait for RViz to finish applying its saved window size
+            QtCore.QTimer.singleShot(2000, lambda: self.move_rviz(int(found.group(1), 16)))
+        elif tries > 0:
+            QtCore.QTimer.singleShot(500, lambda: self.place_rviz(tries - 1))
+
+    def move_rviz(self, window_id):
+        area = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        half = area.width() // 2
+        QtGui.QWindow.fromWinId(window_id).setGeometry(
+            area.x() + half, area.y(), area.width() - half, self.height())
+
     def fit_to_screen(self):
-        """Open as large as useful, but with the whole window (title bar too) on the screen."""
+        """Fill the left half of the screen, leaving the right half for RViz."""
         area = QtWidgets.QApplication.primaryScreen().availableGeometry()
         line = self.fontMetrics().height()
-        room_h = area.height() - 2 * line   # window title bar and frame
-        room_w = area.width() - 2 * line
+        room_h = area.height() - 3 * line   # window title bar and frame
         controls = self.scroll.widget().sizeHint()
         lay = self.layout()
         m = lay.contentsMargins()
         fixed = (m.top() + m.bottom() + 3 * lay.spacing() + self.st['battery'].sizeHint().height()
                  + self.estop_btn.minimumSizeHint().height() + self.tabs.minimumSizeHint().height())
-        scroll_h = min(controls.height(), max(room_h - fixed, 4 * line))
-        self.scroll.setMinimumHeight(scroll_h)
-        extra = 12 * line   # log lines beyond the minimum, when the screen has room
-        self.resize(min(controls.width() + m.left() + m.right() + 2 * line, room_w),
-                    min(fixed + scroll_h + extra, room_h))
+        self.scroll.setMinimumHeight(min(controls.height(), max(room_h - fixed, 4 * line)))
+        self.resize(area.width() // 2, room_h)
+        self.move(area.topLeft())
 
     # ---------- actions ----------
     def selected_map(self):
@@ -427,7 +470,8 @@ class Panel(QtWidgets.QWidget):
             'bringup': 'ros2 launch f1tenth_stack bringup_launch.py use_joy:=false',
             'slam': f'ros2 launch slam_toolbox online_async_launch.py slam_params_file:={SLAM_PARAMS}',
             'localize': f'ros2 launch waypoint_nav localize_launch.py map:={self.selected_map()}',
-            'rviz': 'rviz2',
+            # QT_FONT_DPI: the desktop text scale would crowd the RViz toolbar at half a screen
+            'rviz': f'env QT_FONT_DPI=60 rviz2 -d {WS}/f1tenth.rviz',
             'pp': ('ros2 run waypoint_nav pure_pursuit --ros-args '
                    f'-p waypoint_file:={self.wp_cb.currentData()} -p max_speed:={self.vmax.value():.2f} '
                    f'-p map_yaml:={self.selected_map()} '
@@ -438,6 +482,8 @@ class Panel(QtWidgets.QWidget):
             self.loc_map = self.selected_map()
         pr.start(cmds[key])
         self.tabs.setCurrentWidget(pr.log)
+        if key == 'rviz':
+            self.place_rviz()
 
     def map_mismatch(self):
         # AMCL keeps the map it was started with; pure pursuit and the scan matcher must use
@@ -565,9 +611,9 @@ class Panel(QtWidgets.QWidget):
         r, now = self.ros, time.monotonic()
         while r.events:
             text = r.events.pop(0)
-            self.event_label.setText(time.strftime('%H:%M:%S ') + text)
-            self.procs['pp'].log.appendPlainText(f'[event] {text}')
-            QtCore.QProcess.startDetached('notify-send', ['-a', 'F1TENTH', 'F1TENTH 자율주행', text])
+            stamped = time.strftime('%H:%M:%S ') + text
+            self.event_label.setText(stamped)
+            self.procs['pp'].log.appendPlainText(f'[event] {stamped}')
 
         def put(k, text, ok):
             color = {True: '#2e7d32', False: '#c62828', None: '#f9a825'}[ok]
@@ -656,6 +702,10 @@ class Panel(QtWidgets.QWidget):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    font = app.font()
+    font.setPointSizeF(font.pointSizeF() * FONT_SCALE)
+    app.setFont(font)
+    app.setStyleSheet('QPushButton { padding: 1px 6px; }')
     w = Panel()
     # rclpy.init (inside Panel) installs its own SIGINT/SIGTERM handlers that only shut the
     # ROS context down and leave the Qt window running: make Ctrl+C / kill end the process
