@@ -26,6 +26,7 @@ setup(
     entry_points={
         'console_scripts': [
             'throttle_interpolator = f1tenth_stack.throttle_interpolator:main',
+            'f710_xinput = f1tenth_stack.f710_xinput:main',
         ],
     },
 )

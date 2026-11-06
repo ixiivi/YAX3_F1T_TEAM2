@@ -19,7 +19,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from PyQt5 import QtCore, QtGui, QtWidgets
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import Joy, LaserScan
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 from vesc_msgs.msg import VescStateStamped
@@ -33,6 +33,22 @@ WPS = os.path.join(WS, 'waypoints')
 SETUP = f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
 SLAM_PARAMS = f'{WS}/src/f1tenth_system/f1tenth_stack/config/f1tenth_online_async.yaml'
 ERPM_GAIN = 4614.0   # speed_to_erpm_gain in vesc.yaml
+REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
+# resting LiPo voltage per cell -> state of charge [%]
+LIPO_SOC = [(3.27, 0), (3.61, 5), (3.69, 10), (3.71, 15), (3.73, 20), (3.75, 25), (3.77, 30),
+            (3.79, 35), (3.80, 40), (3.82, 45), (3.84, 50), (3.85, 55), (3.87, 60), (3.91, 65),
+            (3.95, 70), (3.98, 75), (4.02, 80), (4.08, 85), (4.11, 90), (4.15, 95), (4.20, 100)]
+
+
+def battery_percent(volts, cells):
+    """Estimated charge [%] from the resting pack voltage."""
+    cell = volts / cells
+    if cell <= LIPO_SOC[0][0]:
+        return 0.0
+    for (v0, p0), (v1, p1) in zip(LIPO_SOC, LIPO_SOC[1:]):
+        if cell <= v1:
+            return p0 + (p1 - p0) * (cell - v0) / (v1 - v0)
+    return 100.0
 
 
 class Proc(QtCore.QObject):
@@ -104,10 +120,12 @@ class RosLink:
         self.scan_times = []
         self.pp_status = ''
         self.pp_status_t = 0.0
+        self.joy_t = 0.0
         self.events = []
         n = self.node
         n.create_subscription(VescStateStamped, '/sensors/core', self._core, 10)
         n.create_subscription(LaserScan, '/scan', self._scan, qos_profile_sensor_data)
+        n.create_subscription(Joy, '/joy', self._joy, 10)
         n.create_subscription(String, '/pure_pursuit/status', self._pp, 10)
         n.create_subscription(String, '/pure_pursuit/event', lambda m: self.events.append(m.data), 10)
         self.teleop_pub = n.create_publisher(AckermannDriveStamped, '/teleop', 10)
@@ -128,6 +146,9 @@ class RosLink:
 
     def _pp(self, m):
         self.pp_status, self.pp_status_t = m.data, time.monotonic()
+
+    def _joy(self, _m):
+        self.joy_t = time.monotonic()
 
     def pose(self):
         try:
@@ -168,15 +189,18 @@ class Panel(QtWidgets.QWidget):
         self.estop = False
         self.target = self.speed = self.steer = 0.0
         self.last_t = self.stopped_at = time.monotonic()
+        self.brake_until = 0.0     # keep braking this long after the gamepad is turned off
+        self.rest_v = None         # smoothed pack voltage at low current, for the charge estimate
 
         self.tabs = nofocus(QtWidgets.QTabWidget())
         self.procs = {}
         for key, label in [('bringup', '드라이버'), ('slam', 'SLAM'), ('localize', '위치 추정'),
                            ('pp', '자율주행'), ('rviz', 'RViz'), ('editor', '웨이포인트 편집'),
-                           ('tool', '맵 저장/위치 찾기')]:
+                           ('tool', '맵 저장/위치 찾기'), ('joy', '조이스틱')]:
             log = QtWidgets.QPlainTextEdit(readOnly=True)
             log.setMaximumBlockCount(3000)
             log.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+            log.setMinimumHeight(self.fontMetrics().height() * 3)
             nofocus(log)
             self.tabs.addTab(log, label)
             pr = Proc(label, log)
@@ -185,14 +209,22 @@ class Panel(QtWidgets.QWidget):
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.addLayout(self._status_row())
-        top = QtWidgets.QHBoxLayout()
+        controls = QtWidgets.QWidget()
+        top = QtWidgets.QHBoxLayout(controls)
+        top.setContentsMargins(0, 0, 0, 0)
         left = QtWidgets.QVBoxLayout()
         left.addWidget(self._run_box())
         left.addWidget(self._map_box())
-        left.addWidget(self._auto_box())
-        top.addLayout(left, 3)
-        top.addWidget(self._manual_box(), 2)
-        lay.addLayout(top)
+        left.addStretch(1)
+        top.addLayout(left)
+        top.addWidget(self._auto_box())
+        top.addWidget(self._manual_box())
+        # on a small screen the controls scroll; E-STOP stays outside so it is always visible
+        self.scroll = nofocus(QtWidgets.QScrollArea(widgetResizable=True))
+        self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.scroll.setWidget(controls)
+        lay.addWidget(self.scroll)
+        lay.addWidget(self._estop_button())
         lay.addWidget(self.tabs, 1)
 
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -212,6 +244,17 @@ class Panel(QtWidgets.QWidget):
             lb.setStyleSheet('padding:4px 8px; border-radius:4px; background:#444; color:white')
             row.addWidget(lb)
             self.st[k] = lb
+        self.st['battery'].setToolTip('잔량은 선택한 셀 수의 LiPo 기준 전압으로 계산한 추정치예요. '
+                                      '주행 중에는 전압이 처져서 값을 갱신하지 않아요.')
+        self.settings = QtCore.QSettings('MAGP', 'control_panel')
+        self.cells_cb = nofocus(QtWidgets.QComboBox())
+        self.cells_cb.setToolTip('배터리 셀 수')
+        self.cells_cb.addItem('3S', 3)
+        self.cells_cb.addItem('4S', 4)
+        self.cells_cb.setCurrentIndex(self.cells_cb.findData(self.settings.value('cells', 3, type=int)))
+        self.cells_cb.currentIndexChanged.connect(
+            lambda: self.settings.setValue('cells', self.cells_cb.currentData()))
+        row.insertWidget(1, self.cells_cb)
         return row
 
     def _button(self, text, slot, color=None):
@@ -224,6 +267,7 @@ class Panel(QtWidgets.QWidget):
     def _run_box(self):
         box = QtWidgets.QGroupBox('실행')
         g = QtWidgets.QGridLayout(box)
+        g.setVerticalSpacing(2)
         self.run_btn = {}
         for r, (key, label) in enumerate([('bringup', '드라이버 (라이다+VESC)'),
                                           ('slam', 'SLAM (맵 만들기)'),
@@ -243,7 +287,7 @@ class Panel(QtWidgets.QWidget):
         g.addWidget(QtWidgets.QLabel('맵'), 0, 0)
         g.addWidget(self.map_cb, 0, 1, 1, 2)
         g.addWidget(self._button('새로고침', self.reload_lists), 0, 3)
-        self.map_name = QtWidgets.QLineEdit(placeholderText='저장 이름 (비우면 map_월일_시분)')
+        self.map_name = QtWidgets.QLineEdit(placeholderText='저장 이름 (선택)')
         g.addWidget(self.map_name, 1, 0, 1, 2)
         self.save_btn = self._button('맵 저장', self.save_map)
         g.addWidget(self.save_btn, 1, 2)
@@ -258,29 +302,32 @@ class Panel(QtWidgets.QWidget):
         g.addWidget(self.wp_cb, 0, 1, 1, 3)
         g.addWidget(QtWidgets.QLabel('최고 속도 [m/s]'), 1, 0)
         self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=3.0, singleStep=0.1, value=1.0)
-        g.addWidget(self.vmax, 1, 1)
+        g.addWidget(self.vmax, 1, 1, 1, 3)
         self.reloc_btn = self._button('위치 다시 찾기', self.relocalize)
-        g.addWidget(self.reloc_btn, 1, 2)
+        g.addWidget(self.reloc_btn, 2, 0, 1, 2)
         self.pp_btn = self._button('자율주행 준비', lambda: self.toggle('pp'))
-        g.addWidget(self.pp_btn, 1, 3)
+        g.addWidget(self.pp_btn, 2, 2, 1, 2)
         self.go_btn = self._button('출발', self.go, '#2e7d32')
         self.stop_btn = self._button('정지 (감속)', lambda: self.ros.pp('stop'), '#f9a825')
-        g.addWidget(self.go_btn, 2, 0, 1, 2)
-        g.addWidget(self.stop_btn, 2, 2, 1, 2)
-        self.pp_label = QtWidgets.QLabel('-')
-        g.addWidget(self.pp_label, 3, 0, 1, 4)
+        g.addWidget(self.go_btn, 3, 0, 1, 2)
+        g.addWidget(self.stop_btn, 3, 2, 1, 2)
         self.avoid_cb = nofocus(QtWidgets.QCheckBox('장애물 우회', checked=True))
         self.reverse_cb = nofocus(QtWidgets.QCheckBox('위치 틀어지면 지나온 길로 후진', checked=True))
-        g.addWidget(self.avoid_cb, 4, 0, 1, 2)
-        g.addWidget(self.reverse_cb, 4, 2, 1, 2)
+        g.addWidget(self.avoid_cb, 4, 0, 1, 4)
+        g.addWidget(self.reverse_cb, 5, 0, 1, 4)
+        # status text can be long: wrap it rather than let it widen the window
+        self.pp_label = QtWidgets.QLabel('-')
+        self.pp_label.setWordWrap(True)
+        g.addWidget(self.pp_label, 6, 0, 1, 4)
         self.event_label = QtWidgets.QLabel('')
         self.event_label.setWordWrap(True)
         self.event_label.setStyleSheet('color:#e65100; font-weight:bold')
-        g.addWidget(self.event_label, 5, 0, 1, 4)
+        g.addWidget(self.event_label, 7, 0, 1, 4)
+        g.setRowStretch(8, 1)
         return box
 
     def _manual_box(self):
-        box = QtWidgets.QGroupBox('수동 주행 / 긴급 정지')
+        box = QtWidgets.QGroupBox('수동 주행')
         v = QtWidgets.QVBoxLayout(box)
         self.manual_btn = self._button('키보드 조종 켜기', self.toggle_manual)
         v.addWidget(self.manual_btn)
@@ -290,14 +337,38 @@ class Panel(QtWidgets.QWidget):
         v.addWidget(QtWidgets.QLabel('W/S 속도 ±   A/D 조향   X 조향 중앙\n'
                                      'Space 감속 정지   B 즉시 정지\n'
                                      '(키 한 번 = 한 단계, 꾹 눌러도 한 번)'))
+        self.joy_btn = self._button('조이스틱 조종 켜기', self.toggle_joy)
+        v.addWidget(self.joy_btn)
+        self.joy_label = QtWidgets.QLabel('꺼짐')
+        v.addWidget(self.joy_label)
+        v.addWidget(QtWidgets.QLabel('RB 누른 채 RT 가속, 왼쪽 스틱 조향\nLB 자율주행 허용   둘 다 놓으면 정지'))
         v.addStretch(1)
+        return box
+
+    def _estop_button(self):
         self.estop_btn = self._button('긴급 정지', self.toggle_estop, '#c62828')
         self.estop_btn.setMinimumHeight(70)
         f = self.estop_btn.font()
         f.setPointSize(f.pointSize() + 6)
         self.estop_btn.setFont(f)
-        v.addWidget(self.estop_btn)
-        return box
+        return self.estop_btn
+
+    def fit_to_screen(self):
+        """Open as large as useful, but with the whole window (title bar too) on the screen."""
+        area = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        line = self.fontMetrics().height()
+        room_h = area.height() - 2 * line   # window title bar and frame
+        room_w = area.width() - 2 * line
+        controls = self.scroll.widget().sizeHint()
+        lay = self.layout()
+        m = lay.contentsMargins()
+        fixed = (m.top() + m.bottom() + 3 * lay.spacing() + self.st['battery'].sizeHint().height()
+                 + self.estop_btn.minimumSizeHint().height() + self.tabs.minimumSizeHint().height())
+        scroll_h = min(controls.height(), max(room_h - fixed, 4 * line))
+        self.scroll.setMinimumHeight(scroll_h)
+        extra = 12 * line   # log lines beyond the minimum, when the screen has room
+        self.resize(min(controls.width() + m.left() + m.right() + 2 * line, room_w),
+                    min(fixed + scroll_h + extra, room_h))
 
     # ---------- actions ----------
     def selected_map(self):
@@ -352,7 +423,8 @@ class Panel(QtWidgets.QWidget):
             if not self.wp_cb.currentData():
                 return self.warn('웨이포인트 파일이 없어요. "웨이포인트 편집"으로 만드세요.')
         cmds = {
-            'bringup': 'ros2 launch f1tenth_stack bringup_launch.py',
+            # the gamepad has its own button: it would otherwise hold /teleop whenever connected
+            'bringup': 'ros2 launch f1tenth_stack bringup_launch.py use_joy:=false',
             'slam': f'ros2 launch slam_toolbox online_async_launch.py slam_params_file:={SLAM_PARAMS}',
             'localize': f'ros2 launch waypoint_nav localize_launch.py map:={self.selected_map()}',
             'rviz': 'rviz2',
@@ -412,14 +484,36 @@ class Panel(QtWidgets.QWidget):
     def toggle_manual(self):
         self.manual = not self.manual
         self.target = self.speed = 0.0
+        if self.manual:
+            self.procs['joy'].stop()   # both drive /teleop: never run them together
         self.setFocus()
         self.refresh()
+
+    def toggle_joy(self):
+        pr = self.procs['joy']
+        if pr.running():
+            self.stop_joy()
+            return
+        if self.estop:
+            return self.warn('긴급 정지를 먼저 해제하세요.')
+        if not self.procs['bringup'].running():
+            return self.warn('드라이버를 먼저 켜세요.')
+        if self.manual:
+            self.toggle_manual()
+        pr.start('ros2 launch f1tenth_stack joy_launch.py')
+        self.tabs.setCurrentWidget(pr.log)
+
+    def stop_joy(self):
+        if self.procs['joy'].running():
+            self.procs['joy'].stop()
+            self.brake_until = time.monotonic() + 0.5   # the last stick command must not linger
 
     def toggle_estop(self):
         self.estop = not self.estop
         if self.estop:
             self.ros.pp('estop')
             self.target = self.speed = 0.0
+            self.stop_joy()   # LB would otherwise still reach /teleop alongside the zeros
         self.refresh()
 
     # ---------- keyboard (manual mode) ----------
@@ -454,7 +548,7 @@ class Panel(QtWidgets.QWidget):
     def tick(self):
         now = time.monotonic()
         dt, self.last_t = now - self.last_t, now
-        if self.estop:
+        if self.estop or now < self.brake_until:
             self.ros.teleop(0.0, 0.0)   # priority 100: overrides everything, brakes
         elif self.manual:
             if self.speed != 0.0:
@@ -482,10 +576,18 @@ class Panel(QtWidgets.QWidget):
         fresh = r.core is not None and now - r.core_t < 1.0
         if fresh:
             v = r.core.voltage_input
-            put('battery', f'배터리 {v:.1f} V', True if v >= 14.8 else (None if v >= 14.0 else False))
+            if self.rest_v is None:
+                self.rest_v = v
+            elif max(abs(r.core.current_input), abs(r.core.current_motor)) < REST_CURRENT:
+                self.rest_v += 0.03 * (v - self.rest_v)   # ~10 s time constant at this 0.3 s timer
+            cells = self.cells_cb.currentData()
+            soc = 5 * round(battery_percent(self.rest_v, cells) / 5)   # VESC reads in 0.1 V: about 5 % steps
+            put('battery', f'배터리 {v:.1f} V · 약 {soc}%',
+                True if v >= 3.7 * cells else (None if v >= 3.5 * cells else False))
             put('vesc', f'VESC fault {r.core.fault_code}', r.core.fault_code == 0)
             put('speed', f'속도 {r.core.speed / ERPM_GAIN:+.2f} m/s', True)
         else:
+            self.rest_v = None   # VESC off: the pack may be swapped before it returns
             put('battery', '배터리 -', False)
             put('vesc', 'VESC 연결 없음', False)
             put('speed', '속도 -', False)
@@ -496,11 +598,18 @@ class Panel(QtWidgets.QWidget):
             put('pose', f'위치 ({pose[0]:.1f}, {pose[1]:.1f}) {math.degrees(pose[2]):.0f}°', True)
         else:
             put('pose', '위치 없음 (SLAM/위치 추정)', None)
+        joy_on = self.procs['joy'].running()
+        joy_live = joy_on and now - r.joy_t < 1.0
+        self.joy_label.setText(('입력 수신 중' if joy_live else '⚠ 패드 입력 없음 (연결·전원 확인)')
+                               if joy_on else '꺼짐')
         if self.procs['pp'].running():
             text = r.pp_status if now - r.pp_status_t < 1.0 else '자율주행 노드 시작 중...'
-            if self.manual or self.estop:
-                text = ('⚠ 긴급 정지 중' if self.estop else '⚠ 키보드 조종이 켜져 있어 자율주행이 막혀 있어요') \
-                    + '  |  ' + text
+            if self.estop:
+                text = '⚠ 긴급 정지 중  |  ' + text
+            elif self.manual:
+                text = '⚠ 키보드 조종이 켜져 있어 자율주행이 막혀 있어요  |  ' + text
+            elif joy_live:
+                text = '⚠ 조이스틱이 켜져 있어 LB를 누르는 동안만 자율주행이 움직여요  |  ' + text
             self.pp_label.setText(text)
         else:
             self.pp_label.setText('-')
@@ -518,6 +627,9 @@ class Panel(QtWidgets.QWidget):
         self.manual_btn.setStyleSheet('background:#1565c0; color:white' if self.manual else '')
         if not self.manual:
             self.manual_label.setText('꺼짐 (켜면 자율주행보다 우선)')
+        joy_on = self.procs['joy'].running()
+        self.joy_btn.setText('조이스틱 조종 끄기' if joy_on else '조이스틱 조종 켜기')
+        self.joy_btn.setStyleSheet('background:#1565c0; color:white' if joy_on else '')
         self.estop_btn.setText('긴급 정지 해제' if self.estop else '긴급 정지')
         self.estop_btn.setStyleSheet(
             ('background:#555;' if self.estop else 'background:#c62828;')
@@ -549,7 +661,7 @@ def main():
     # ROS context down and leave the Qt window running: make Ctrl+C / kill end the process
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
-    w.resize(1000, 800)
+    w.fit_to_screen()
     w.show()
     code = app.exec_()
     # child programs are already stopped by closeEvent. Tearing down rclpy while its spin

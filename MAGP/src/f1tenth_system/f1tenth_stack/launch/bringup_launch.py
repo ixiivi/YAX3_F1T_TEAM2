@@ -26,6 +26,7 @@ from launch.substitutions import Command
 from launch.substitutions import LaunchConfiguration
 from launch.actions import DeclareLaunchArgument
 from launch.actions import IncludeLaunchDescription
+from launch.conditions import IfCondition
 from launch_xml.launch_description_sources import XMLLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -69,19 +70,26 @@ def generate_launch_description():
         default_value=mux_config,
         description='Descriptions for ackermann mux configs')
 
-    ld = LaunchDescription([joy_la, vesc_la, sensors_la, mux_la])
+    use_joy_la = DeclareLaunchArgument(
+        'use_joy',
+        default_value='true',
+        description='Start joy and joy_teleop (the control panel starts them separately)')
+
+    ld = LaunchDescription([joy_la, vesc_la, sensors_la, mux_la, use_joy_la])
 
     joy_node = Node(
-        package='joy',
-        executable='joy_node',
+        package='f1tenth_stack',
+        executable='f710_xinput',
         name='joy',
-        parameters=[LaunchConfiguration('joy_config')]
+        parameters=[LaunchConfiguration('joy_config')],
+        condition=IfCondition(LaunchConfiguration('use_joy'))
     )
     joy_teleop_node = Node(
         package='joy_teleop',
         executable='joy_teleop',
         name='joy_teleop',
-        parameters=[LaunchConfiguration('joy_config')]
+        parameters=[LaunchConfiguration('joy_config')],
+        condition=IfCondition(LaunchConfiguration('use_joy'))
     )
     ackermann_to_vesc_node = Node(
         package='vesc_ackermann',

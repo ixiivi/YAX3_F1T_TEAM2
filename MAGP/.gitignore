@@ -3,6 +3,9 @@ build/
 install/
 log/
 
+# driving records (pure_pursuit run_log_dir)
+runs/
+
 # slam_toolbox pose graphs are large and stay on this Jetson
 maps/*.data
 maps/*.posegraph

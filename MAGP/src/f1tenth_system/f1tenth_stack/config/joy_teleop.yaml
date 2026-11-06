@@ -1,10 +1,9 @@
 joy:
   ros__parameters:
-    # device_name: /dev/input/joypad-f710
-    device_id: 0
-    deadzone: 0.01
-    autorepeat_rate: 20.0
-    coalesce_interval: 0.01
+    # f710_xinput: stick X inside the deadzone is straight, at steer_full it is full lock
+    steer_deadzone: 0.08
+    steer_full: 0.92
+    silence_timeout: 1.0
 
 joy_teleop:
   ros__parameters:
@@ -26,14 +25,14 @@ joy_teleop:
       type: topic
       interface_type: ackermann_msgs/msg/AckermannDriveStamped
       topic_name: teleop
-      deadman_buttons: [4]
+      deadman_buttons: [5]  # RB
       axis_mappings:
         drive-speed:
-          axis: 1
-          scale: 5.0
+          axis: 4  # RT
+          scale: 1.25
           offset: 0.0
         drive-steering_angle:
-          axis: 2
+          axis: 0  # left stick X
           scale: 0.34
           offset: 0.0
 
@@ -41,7 +40,7 @@ joy_teleop:
       type: topic
       interface_type: std_msgs/msg/Int8
       topic_name: /dev/null
-      deadman_buttons: [5]
+      deadman_buttons: [4]  # LB
       message_value:
         data:
           value: 0

@@ -10,6 +10,7 @@
   <depend>ackermann_msgs</depend>
   <depend>urg_node</depend>
   <depend>joy</depend>
+  <exec_depend>python3-usb</exec_depend>
   <depend>joy_teleop</depend>
   <depend>rosbridge_server</depend>
   <depend>vesc</depend>
