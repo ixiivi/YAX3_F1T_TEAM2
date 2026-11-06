@@ -4,7 +4,7 @@
 
 ## 1. 목표와 요구사항
 
-지금 쓰는 제어판(`~/f1tenth_ws/control_panel.py`, PyQt5)은 Jetson 화면에서 직접 돌린다. 그래서 원격으로 쓰려면 RustDesk로 화면을 통째로 보내야 한다.
+지금 쓰는 제어판(`~/MAGP/MAGP/control_panel.py`, PyQt5)은 Jetson 화면에서 직접 돌린다. 그래서 원격으로 쓰려면 RustDesk로 화면을 통째로 보내야 한다.
 대회장에서는 Wi-Fi가 혼잡하고 인터넷이 없을 수 있다. 화면 스트리밍은 Jetson의 CPU/GPU도 잡아먹는다.
 그래서 **맥북에서 도는 GUI가 SSH로만 차와 통신하는 구조**로 바꾼다.
 
@@ -42,17 +42,17 @@ mac_panel.py  = 범용 렌더러 (PyQt6)            panel_server.py  (헤드리�
 | 항목 | 값 |
 |---|---|
 | 차 | Jetson Orin Nano Super, JetPack R36.4.7, ROS 2 Humble, Python 3.10 |
-| 워크스페이스 | `~/f1tenth_ws` (`source /opt/ros/humble/setup.bash && source ~/f1tenth_ws/install/setup.bash`) |
+| 워크스페이스 | `~/MAGP/MAGP` (`source /opt/ros/humble/setup.bash && source ~/MAGP/MAGP/install/setup.bash`) |
 | 네트워크 | Wi-Fi `wlP1p1s0` (현재 아이폰 핫스팟 172.20.10.x), Tailscale 100.93.106.78, 이더넷 192.168.0.15는 **라이다 전용** |
-| 맵 | `~/f1tenth_ws/maps/<name>.{yaml,pgm,posegraph,data}` |
-| 웨이포인트 | `~/f1tenth_ws/waypoints/<map>_wp.csv`, 헤더 `x,y,speed` (map frame), 미리보기 `.png` |
+| 맵 | `~/MAGP/MAGP/maps/<name>.{yaml,pgm,posegraph,data}` |
+| 웨이포인트 | `~/MAGP/MAGP/waypoints/<map>_wp.csv`, 헤더 `x,y,speed` (map frame), 미리보기 `.png` |
 | 미설치 | `tmux`, `websockets`, `fastapi` (설치돼 있음: numpy, PIL, yaml, PyQt5) |
 
 **ackermann_mux** (`src/f1tenth_system/f1tenth_stack/config/mux.yaml`):
 - `/drive`: 자율주행 입력, priority 10, timeout 0.2 s
 - `/teleop`: 수동/E-STOP 입력, priority 100, timeout 0.2 s
 
-**지금 제어판의 기능 로직은 전부 서버로 옮긴다.** 기준 파일은 `~/f1tenth_ws/control_panel.py`다.
+**지금 제어판의 기능 로직은 전부 서버로 옮긴다.** 기준 파일은 `~/MAGP/MAGP/control_panel.py`다.
 
 | 기존 위치 | 내용 | 옮길 곳 |
 |---|---|---|
@@ -187,7 +187,7 @@ vbox
 
 ## 8. 구현 순서
 
-1. **서버 뼈대** (`~/f1tenth_ws/panel_server.py`, `panel_ui.py`, `panel_server.sh`)
+1. **서버 뼈대** (`~/MAGP/MAGP/panel_server.py`, `panel_ui.py`, `panel_server.sh`)
    - TCP 서버, `ui`/`update`/`log`/`dialog` 전송
    - `control_panel.py` 로직 이전(3절 표)
    - 20 Hz 루프, E-STOP, 데드맨

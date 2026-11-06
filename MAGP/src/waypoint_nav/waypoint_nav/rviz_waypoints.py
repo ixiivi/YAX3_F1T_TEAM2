@@ -7,7 +7,7 @@ Usage:
 In RViz: pick "Publish Point" in the toolbar (or press its >> menu), click on the map.
 Each click adds one point (the tool deselects after a click, pick it again).
 Keys in this terminal:
-  enter  smooth, compute speeds, save ~/f1tenth_ws/waypoints/<name>.csv
+  enter  smooth, compute speeds, save ~/MAGP/MAGP/waypoints/<name>.csv
   z      remove last point      c  toggle closed loop / open path
   r      clear all points       q  quit
 The clicked points (orange) and the smoothed path (blue) show on /waypoints_preview.
@@ -27,7 +27,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from waypoint_nav.path_tools import smooth_path, speed_profile, write_csv
 
-WP_DIR = os.path.expanduser('~/f1tenth_ws/waypoints')
+WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
 
 
 class RvizWaypoints(Node):

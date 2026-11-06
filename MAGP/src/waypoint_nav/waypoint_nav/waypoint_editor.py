@@ -28,7 +28,7 @@ from PIL import Image  # noqa: E402
 
 from waypoint_nav.path_tools import smooth_path, speed_profile, write_csv  # noqa: E402
 
-WP_DIR = os.path.expanduser('~/f1tenth_ws/waypoints')
+WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
 
 
 def load_map(yaml_path):
@@ -159,7 +159,7 @@ class Editor:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument('map_yaml')
-    p.add_argument('--out', default=None, help='CSV file name in ~/f1tenth_ws/waypoints')
+    p.add_argument('--out', default=None, help='CSV file name in ~/MAGP/MAGP/waypoints')
     p.add_argument('--vmax', type=float, default=3.0,
                    help='speed cap stored in the CSV [m/s]; drive speed is set by pure_pursuit max_speed')
     p.add_argument('--vmin', type=float, default=0.5,

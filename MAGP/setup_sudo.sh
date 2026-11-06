@@ -12,7 +12,7 @@ sudo udevadm trigger
 
 echo "== 4. rosdep dependencies"
 source /opt/ros/humble/setup.bash
-cd "$HOME/f1tenth_ws"
+cd "$HOME/MAGP/MAGP"
 sudo apt-get update
 sudo apt-get install -y ros-humble-asio-cmake-module
 rosdep install --include-eol --from-paths src -i -y --rosdistro=humble

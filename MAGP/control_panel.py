@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """F1TENTH control panel: start/stop the stack, save maps, edit waypoints, drive.
 
-Run with ~/f1tenth_ws/panel.sh (sources ROS). Every program runs as a child process; its
+Run with ~/MAGP/MAGP/panel.sh (sources ROS). Every program runs as a child process; its
 output goes to a log tab. Manual driving and E-STOP publish on /teleop (mux priority 100),
 so they override autonomous /drive commands at any time.
 """
@@ -27,7 +27,7 @@ from vesc_msgs.msg import VescStateStamped
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import keyboard_teleop as kt  # noqa: E402  (speed steps / ramps shared with the terminal teleop)
 
-WS = os.path.expanduser('~/f1tenth_ws')
+WS = os.path.expanduser('~/MAGP/MAGP')
 MAPS = os.path.join(WS, 'maps')
 WPS = os.path.join(WS, 'waypoints')
 SETUP = f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
