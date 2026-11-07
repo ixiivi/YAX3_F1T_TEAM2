@@ -2,7 +2,7 @@
 """F1TENTH control panel: start/stop the stack, save maps, edit waypoints, drive.
 
 Run with ~/MAGP/MAGP/panel.sh (sources ROS). Every program runs as a child process; its
-output goes to a log tab. Manual driving and E-STOP publish on /teleop (mux priority 100),
+output goes to a log tab and to logs/latest/<program>.log. Manual driving and E-STOP publish on /teleop (mux priority 100),
 so they override autonomous /drive commands at any time.
 """
 import glob
@@ -32,16 +32,44 @@ import keyboard_teleop as kt  # noqa: E402  (speed steps / ramps shared with the
 WS = os.path.expanduser('~/MAGP/MAGP')
 MAPS = os.path.join(WS, 'maps')
 WPS = os.path.join(WS, 'waypoints')
-SETUP = f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
+LOGS = os.path.join(WS, 'logs')
+LOG_DIR = os.path.join(LOGS, time.strftime('%Y%m%d_%H%M%S'))  # this panel's copies of the log tabs
+LOG_FILE_MAX = 50_000_000   # [characters] per log file
+SETUP =f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
 SLAM_PARAMS = f'{WS}/src/f1tenth_system/f1tenth_stack/config/f1tenth_online_async.yaml'
 LOG_LINES = 9
-FONT_SCALE = 0.63    # the desktop text scale is 2x, which is too large for half a screen
+FONT_SCALE = 0.63    # the desktop text scale is 2x, which is too large for a third of a screen
+STATUS_CARD = 'padding:2px 6px; border-radius:4px; color:white;'
 ERPM_GAIN = 4614.0   # speed_to_erpm_gain in vesc.yaml
 REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
 # resting LiPo voltage per cell -> state of charge [%]
 LIPO_SOC = [(3.27, 0), (3.61, 5), (3.69, 10), (3.71, 15), (3.73, 20), (3.75, 25), (3.77, 30),
             (3.79, 35), (3.80, 40), (3.82, 45), (3.84, 50), (3.85, 55), (3.87, 60), (3.91, 65),
             (3.95, 70), (3.98, 75), (4.02, 80), (4.08, 85), (4.11, 90), (4.15, 95), (4.20, 100)]
+
+
+def map_label(path):
+    return os.path.basename(path)[:-5] if path else '없음'
+
+
+def waypoint_problem(map_name, wp_path):
+    """Why this waypoint file cannot be driven on this map, or None. Waypoint files are named
+    <map>_<anything>.csv; a route from another map can still lie mostly inside this one, so
+    pure_pursuit's own check on the map area does not catch it."""
+    if not wp_path:
+        return f'{map_name} 맵의 웨이포인트 파일이 없어요. "웨이포인트 편집"으로 만드세요.'
+    name = os.path.basename(wp_path)
+    if not name.startswith(f'{map_name}_'):
+        return (f'{name} 은(는) {map_name} 맵의 웨이포인트가 아니에요.\n'
+                f'{map_name}_wp.csv 를 고르거나 "웨이포인트 편집"으로 만드세요.')
+    try:
+        with open(wp_path) as f:
+            points = sum(1 for line in f if line.strip()) - 1  # without the header
+    except OSError as e:
+        return f'{name} 을(를) 읽지 못했어요: {e}'
+    if points < 2:
+        return f'{name} 이(가) 비어 있어요. "웨이포인트 편집"으로 다시 만드세요.'
+    return None
 
 
 def battery_percent(volts, cells):
@@ -55,13 +83,72 @@ def battery_percent(volts, cells):
     return 100.0
 
 
+def log_lines(pending, text):
+    """Split program output into finished lines, as (lines, unfinished rest). Terminal status
+    updates that overwrite themselves with \\r are dropped: the run log CSV records them."""
+    parts = (pending + text).split('\n')
+    lines = []
+    for part in parts[:-1]:
+        line = part.rsplit('\r', 1)[-1]
+        # a status line without a newline may sit right in front of a ROS log message
+        m = re.search(r'\[(DEBUG|INFO|WARN|ERROR|FATAL)\]', line)
+        lines.append(line[m.start():] if m else line)
+    return lines, parts[-1].rsplit('\r', 1)[-1]
+
+
+class LogFile:
+    """Copy of one log tab under logs/<panel start time>/<key>.log, one timestamped line at a
+    time. A disk problem turns the copy off; it never gets in the way of driving."""
+
+    def __init__(self, key):
+        self.path = os.path.join(LOG_DIR, f'{key}.log')
+        self.f = None
+        self.size = 0
+        self.pending = ''
+        self.off = False
+
+    def _open(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
+        latest = os.path.join(LOGS, 'latest')
+        if os.path.islink(latest) or not os.path.exists(latest):
+            if os.path.islink(latest):
+                os.remove(latest)
+            os.symlink(os.path.basename(LOG_DIR), latest)
+        self.f = open(self.path, 'a', encoding='utf-8', errors='replace')
+
+    def write(self, text):
+        lines, self.pending = log_lines(self.pending, text)
+        self._put(lines)
+
+    def note(self, text):
+        self._put([text])
+
+    def _put(self, lines):
+        if self.off or not lines:
+            return
+        try:
+            if self.f is None:
+                self._open()
+            stamp = time.strftime('%H:%M:%S')
+            data = ''.join(f'{stamp} {line}\n' for line in lines)
+            if self.size + len(data) > LOG_FILE_MAX:
+                data = f'{stamp} [log file full, stopped copying here]\n'
+                self.off = True
+            self.f.write(data)
+            self.f.flush()
+            self.size += len(data)
+        except OSError:
+            self.off = True
+
+
 class Proc(QtCore.QObject):
     """One child program in its own process group, output streamed to a log widget."""
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, name, log):
+    def __init__(self, name, log, key):
         super().__init__()
         self.name, self.log = name, log
+        self.file = LogFile(key)
         self.p = None
 
     def running(self):
@@ -79,6 +166,7 @@ class Proc(QtCore.QObject):
         self.p.readyReadStandardOutput.connect(self._read)
         self.p.finished.connect(self._finished)
         self.log.appendPlainText(f'$ {cmd}\n')
+        self.file.note(f'$ {cmd}')
         # setsid: own process group, so stop() reaches every node a launch file started
         self.p.start('setsid', ['bash', '-c', f'{SETUP} && exec {cmd}'])
         self.changed.emit()
@@ -104,12 +192,14 @@ class Proc(QtCore.QObject):
 
     def _read(self):
         text = bytes(self.p.readAllStandardOutput()).decode(errors='replace')
+        self.file.write(text)
         self.log.moveCursor(QtGui.QTextCursor.End)
         self.log.insertPlainText(text)
         self.log.moveCursor(QtGui.QTextCursor.End)
 
     def _finished(self, code, _status):
         self.log.appendPlainText(f'\n[{self.name} exited, code {code}]\n')
+        self.file.note(f'[{self.name} exited, code {code}]')
         self.changed.emit()
 
 
@@ -196,6 +286,7 @@ class Panel(QtWidgets.QWidget):
         self.ros = RosLink()
         self.manual = False
         self.loc_map = None        # map the running localization was started with
+        self.pp_setup = (None, None)  # map and waypoints the running autonomy was started with
         self.estop = False
         self.target = self.speed = self.steer = 0.0
         self.last_t = self.stopped_at = time.monotonic()
@@ -206,14 +297,15 @@ class Panel(QtWidgets.QWidget):
         self.procs = {}
         for key, label in [('bringup', '드라이버'), ('slam', 'SLAM'), ('localize', '위치 추정'),
                            ('pp', '자율주행'), ('rviz', 'RViz'), ('editor', '웨이포인트 편집'),
-                           ('tool', '맵 저장/위치 찾기'), ('joy', '조이스틱')]:
+                           ('map_editor', '맵 편집'), ('tool', '맵 저장/위치 찾기'),
+                           ('joy', '조이스틱')]:
             log = QtWidgets.QPlainTextEdit(readOnly=True)
             log.setMaximumBlockCount(3000)
             log.setFont(fixed_font())
             log.setMinimumHeight(QtGui.QFontMetrics(fixed_font()).lineSpacing() * LOG_LINES + 8)
             nofocus(log)
             self.tabs.addTab(log, label)
-            pr = Proc(label, log)
+            pr = Proc(label, log, key)
             pr.changed.connect(self.refresh)
             self.procs[key] = pr
 
@@ -232,8 +324,8 @@ class Panel(QtWidgets.QWidget):
         rows.addLayout(top)
         rows.addWidget(self._manual_box())
         for box in controls.findChildren(QtWidgets.QGroupBox):
-            box.layout().setContentsMargins(8, 2, 8, 2)
-            box.layout().setSpacing(2)
+            box.layout().setContentsMargins(6, 5, 6, 5)
+            box.layout().setSpacing(3)
         # on a small screen the controls scroll; E-STOP stays outside so it is always visible
         self.scroll = nofocus(QtWidgets.QScrollArea(widgetResizable=True))
         self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -252,13 +344,21 @@ class Panel(QtWidgets.QWidget):
 
     # ---------- layout ----------
     def _status_row(self):
-        row = QtWidgets.QHBoxLayout()
+        # the name sits above each card and the card holds only the value, to keep the row narrow
+        row = self.status = QtWidgets.QGridLayout()
+        row.setHorizontalSpacing(4)
+        row.setVerticalSpacing(1)
         self.st = {}
-        for k in ('battery', 'vesc', 'lidar', 'pose', 'speed'):
-            lb = QtWidgets.QLabel('-')
-            lb.setStyleSheet('padding:4px 8px; border-radius:4px; background:#444; color:white')
-            row.addWidget(lb)
+        for c, (k, name) in enumerate((('battery', '배터리'), ('vesc', 'VESC'), ('lidar', '라이다'),
+                                       ('pose', '위치'), ('speed', '속도'))):
+            if k != 'battery':   # its name shares a row with the cell count below
+                row.addWidget(QtWidgets.QLabel(name), 0, c)
+            lb = QtWidgets.QLabel('-', alignment=QtCore.Qt.AlignCenter)
+            lb.setStyleSheet(f'{STATUS_CARD} background:#444')
+            row.addWidget(lb, 1, c)
+            row.setColumnStretch(c, 1)
             self.st[k] = lb
+        self.st['pose'].setToolTip('SLAM이나 위치 추정을 켜면 나와요')
         self.st['battery'].setToolTip('잔량은 선택한 셀 수의 LiPo 기준 전압으로 계산한 추정치예요. '
                                       '주행 중에는 전압이 처져서 값을 갱신하지 않아요.')
         self.settings = QtCore.QSettings('MAGP', 'control_panel')
@@ -269,7 +369,10 @@ class Panel(QtWidgets.QWidget):
         self.cells_cb.setCurrentIndex(self.cells_cb.findData(self.settings.value('cells', 3, type=int)))
         self.cells_cb.currentIndexChanged.connect(
             lambda: self.settings.setValue('cells', self.cells_cb.currentData()))
-        row.insertWidget(1, self.cells_cb)
+        title = QtWidgets.QHBoxLayout()
+        title.addWidget(QtWidgets.QLabel('배터리'))
+        title.addWidget(self.cells_cb)
+        row.addLayout(title, 0, 0)
         return row
 
     def _button(self, text, slot, color=None):
@@ -283,7 +386,7 @@ class Panel(QtWidgets.QWidget):
         # size to a short name, so one long file name cannot widen the whole panel
         c = nofocus(QtWidgets.QComboBox())
         c.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
-        c.setMinimumContentsLength(8)
+        c.setMinimumContentsLength(5)
         return c
 
     def _run_box(self):
@@ -291,12 +394,15 @@ class Panel(QtWidgets.QWidget):
         g = QtWidgets.QGridLayout(box)
         g.setVerticalSpacing(2)
         self.run_btn = {}
-        for r, (key, label) in enumerate([('bringup', '드라이버 (라이다+VESC)'),
-                                          ('slam', 'SLAM (맵 만들기)'),
-                                          ('localize', '위치 추정 (AMCL)'),
-                                          ('rviz', 'RViz')]):
-            g.addWidget(QtWidgets.QLabel(label), r, 0)
+        for r, (key, label, tip) in enumerate([('bringup', '드라이버', '라이다 + VESC'),
+                                               ('slam', 'SLAM', '맵 만들기'),
+                                               ('localize', '위치 추정', 'AMCL'),
+                                               ('rviz', 'RViz', '')]):
+            name = QtWidgets.QLabel(label)
+            name.setToolTip(tip)
+            g.addWidget(name, r, 0)
             b = self._button('켜기', lambda _=False, k=key: self.toggle(k))
+            b.setToolTip(tip)
             self.run_btn[key] = b
             g.addWidget(b, r, 1)
         g.setColumnStretch(0, 1)   # spare width goes to the labels, not the buttons
@@ -307,14 +413,19 @@ class Panel(QtWidgets.QWidget):
         g = QtWidgets.QGridLayout(box)
         self.map_cb = self._combo()
         self.map_cb.currentIndexChanged.connect(self.map_changed)
-        g.addWidget(QtWidgets.QLabel('맵'), 0, 0)
-        g.addWidget(self.map_cb, 0, 1, 1, 2)
-        g.addWidget(self._button('새로고침', self.reload_lists), 0, 3)
-        self.map_name = QtWidgets.QLineEdit(placeholderText='저장 이름 (선택)')
-        g.addWidget(self.map_name, 1, 0, 1, 2)
+        g.addWidget(self.map_cb, 0, 0)
+        g.addWidget(self._button('새로고침', self.reload_lists), 0, 1)
+        self.map_name = QtWidgets.QLineEdit(placeholderText='저장 이름')
+        self.map_name.setMinimumWidth(10)
+        g.addWidget(self.map_name, 1, 0)
         self.save_btn = self._button('맵 저장', self.save_map)
-        g.addWidget(self.save_btn, 1, 2)
-        g.addWidget(self._button('웨이포인트 편집', self.edit_waypoints), 1, 3)
+        g.addWidget(self.save_btn, 1, 1)
+        g.addWidget(self._button('웨이포인트 편집', self.edit_waypoints), 2, 0)
+        self.map_edit_btn = self._button('맵 편집', self.edit_map)
+        self.map_edit_btn.setToolTip('벽 지우기/그리기. 처음 저장할 때 원본을 <맵>_orig.pgm으로 보관해요.\n'
+                                     '저장한 맵은 위치 추정을 다시 켜야 적용돼요.')
+        g.addWidget(self.map_edit_btn, 2, 1)
+        g.setColumnStretch(0, 1)
         return box
 
     def _auto_box(self):
@@ -323,10 +434,12 @@ class Panel(QtWidgets.QWidget):
         self.wp_cb = self._combo()
         g.addWidget(QtWidgets.QLabel('웨이포인트'), 0, 0)
         g.addWidget(self.wp_cb, 0, 1, 1, 3)
-        g.addWidget(QtWidgets.QLabel('최고 속도 [m/s]'), 1, 0)
-        self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=3.0, singleStep=0.1, value=1.0)
+        g.addWidget(QtWidgets.QLabel('최고 속도'), 1, 0)
+        self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=3.0, singleStep=0.1, value=1.0,
+                                             suffix=' m/s')
         g.addWidget(self.vmax, 1, 1, 1, 3)
-        self.reloc_btn = self._button('위치 다시 찾기', self.relocalize)
+        self.reloc_btn = self._button('위치 찾기', self.relocalize)
+        self.reloc_btn.setToolTip('맵 전체에서 현재 위치를 다시 찾아요')
         g.addWidget(self.reloc_btn, 2, 0, 1, 2)
         self.pp_btn = self._button('자율주행 준비', lambda: self.toggle('pp'))
         g.addWidget(self.pp_btn, 2, 2, 1, 2)
@@ -335,7 +448,8 @@ class Panel(QtWidgets.QWidget):
         g.addWidget(self.go_btn, 3, 0, 1, 2)
         g.addWidget(self.stop_btn, 3, 2, 1, 2)
         self.avoid_cb = nofocus(QtWidgets.QCheckBox('장애물 우회', checked=True))
-        self.reverse_cb = nofocus(QtWidgets.QCheckBox('위치 틀어지면 지나온 길로 후진', checked=True))
+        self.reverse_cb = nofocus(QtWidgets.QCheckBox('위치 틀어지면 후진', checked=True))
+        self.reverse_cb.setToolTip('위치가 틀어지면 지나온 길로 후진해요')
         g.addWidget(self.avoid_cb, 4, 0, 1, 4)
         g.addWidget(self.reverse_cb, 5, 0, 1, 4)
         # status text can be long: wrap it rather than let it widen the window
@@ -353,22 +467,24 @@ class Panel(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox('수동 주행')
         row = QtWidgets.QHBoxLayout(box)
         v = QtWidgets.QVBoxLayout()
-        self.manual_btn = self._button('키보드 조종 켜기', self.toggle_manual)
+        self.manual_btn = self._button('키보드 켜기', self.toggle_manual)
         self.manual_btn.setToolTip('W/S 속도 ±   A/D 조향   X 조향 중앙\n'
                                    'Space 감속 정지   B 즉시 정지\n'
                                    '키 한 번 = 한 단계, 꾹 눌러도 한 번')
         v.addWidget(self.manual_btn)
         self.manual_label = QtWidgets.QLabel('꺼짐')
         self.manual_label.setFont(fixed_font())
+        self.manual_label.setWordWrap(True)
         v.addWidget(self.manual_label)
         v.addStretch(1)
         row.addLayout(v, 1)
         v = QtWidgets.QVBoxLayout()
-        self.joy_btn = self._button('조이스틱 조종 켜기', self.toggle_joy)
+        self.joy_btn = self._button('조이스틱 켜기', self.toggle_joy)
         self.joy_btn.setToolTip('RB 누른 채 RT 가속, 왼쪽 스틱 조향\n'
                                 'LB 자율주행 허용   둘 다 놓으면 정지')
         v.addWidget(self.joy_btn)
         self.joy_label = QtWidgets.QLabel('꺼짐')
+        self.joy_label.setWordWrap(True)
         v.addWidget(self.joy_label)
         v.addStretch(1)
         row.addLayout(v, 1)
@@ -383,7 +499,7 @@ class Panel(QtWidgets.QWidget):
         return self.estop_btn
 
     def place_rviz(self, tries=20):
-        """Move RViz to the right half. It ignores -geometry, so find its window once it opens."""
+        """Move RViz beside this window. It ignores -geometry, so find its window once it opens."""
         out = subprocess.run(['xwininfo', '-root', '-tree'],
                              capture_output=True, text=True, check=False).stdout
         found = re.search(r'(0x[0-9a-f]+) "[^"]*RViz[^"]*": \("rviz2"', out)
@@ -394,24 +510,30 @@ class Panel(QtWidgets.QWidget):
             QtCore.QTimer.singleShot(500, lambda: self.place_rviz(tries - 1))
 
     def move_rviz(self, window_id):
+        """Fill the screen to the right of this window: two thirds, unless it was resized."""
         area = QtWidgets.QApplication.primaryScreen().availableGeometry()
-        half = area.width() // 2
+        left = self.frameGeometry().right() + 1
         QtGui.QWindow.fromWinId(window_id).setGeometry(
-            area.x() + half, area.y(), area.width() - half, self.height())
+            left, area.y(), area.right() + 1 - left, self.height())
 
     def fit_to_screen(self):
-        """Fill the left half of the screen, leaving the right half for RViz."""
+        """Fill the left third of the screen, leaving the other two thirds for RViz."""
         area = QtWidgets.QApplication.primaryScreen().availableGeometry()
         line = self.fontMetrics().height()
-        room_h = area.height() - 3 * line   # window title bar and frame
-        controls = self.scroll.widget().sizeHint()
+        self.resize(area.width() // 3, area.height() - 3 * line)   # title bar and frame
+        self.move(area.topLeft())
+
+    def resizeEvent(self, ev):
+        # wrapped labels make the controls taller as the window narrows: take that height from
+        # the logs, and only scroll once the logs are down to their minimum
+        super().resizeEvent(ev)
         lay = self.layout()
         m = lay.contentsMargins()
-        fixed = (m.top() + m.bottom() + 3 * lay.spacing() + self.st['battery'].sizeHint().height()
+        fixed = (m.top() + m.bottom() + 3 * lay.spacing() + self.status.sizeHint().height()
                  + self.estop_btn.minimumSizeHint().height() + self.tabs.minimumSizeHint().height())
-        self.scroll.setMinimumHeight(min(controls.height(), max(room_h - fixed, 4 * line)))
-        self.resize(area.width() // 2, room_h)
-        self.move(area.topLeft())
+        need = self.scroll.widget().layout().totalHeightForWidth(self.width() - m.left() - m.right())
+        self.scroll.setMinimumHeight(min(need, max(self.height() - fixed,
+                                                   4 * self.fontMetrics().height())))
 
     # ---------- actions ----------
     def selected_map(self):
@@ -463,14 +585,17 @@ class Panel(QtWidgets.QWidget):
                 return self.warn('위치 추정을 먼저 켜세요.')
             if self.map_mismatch():
                 return
-            if not self.wp_cb.currentData():
-                return self.warn('웨이포인트 파일이 없어요. "웨이포인트 편집"으로 만드세요.')
+            problem = waypoint_problem(self.map_cb.currentText(), self.wp_cb.currentData())
+            if problem:
+                return self.warn(problem)
+        if key == 'localize' and self.procs['pp'].running():
+            return self.warn('자율주행을 먼저 끄세요. 켜져 있는 자율주행은 처음 켤 때의 맵을 계속 써요.')
         cmds = {
             # the gamepad has its own button: it would otherwise hold /teleop whenever connected
             'bringup': 'ros2 launch f1tenth_stack bringup_launch.py use_joy:=false',
             'slam': f'ros2 launch slam_toolbox online_async_launch.py slam_params_file:={SLAM_PARAMS}',
             'localize': f'ros2 launch waypoint_nav localize_launch.py map:={self.selected_map()}',
-            # QT_FONT_DPI: the desktop text scale would crowd the RViz toolbar at half a screen
+            # QT_FONT_DPI: the desktop text scale would crowd the RViz toolbar
             'rviz': f'env QT_FONT_DPI=60 rviz2 -d {WS}/f1tenth.rviz',
             'pp': ('ros2 run waypoint_nav pure_pursuit --ros-args '
                    f'-p waypoint_file:={self.wp_cb.currentData()} -p max_speed:={self.vmax.value():.2f} '
@@ -480,6 +605,8 @@ class Panel(QtWidgets.QWidget):
         }
         if key == 'localize':
             self.loc_map = self.selected_map()
+        if key == 'pp':
+            self.pp_setup = (self.selected_map(), self.wp_cb.currentData())
         pr.start(cmds[key])
         self.tabs.setCurrentWidget(pr.log)
         if key == 'rviz':
@@ -493,6 +620,21 @@ class Panel(QtWidgets.QWidget):
         self.warn(f'위치 추정은 {os.path.basename(self.loc_map)[:-5]} 맵으로 켜져 있어요.\n'
                   '맵을 바꾸려면 위치 추정을 끄고 다시 켜세요.')
         return True
+
+    def drive_problem(self):
+        """Why the running autonomy must not start: it keeps the map and route it was started
+        with, whatever the panel shows now."""
+        pp_map, pp_wp = self.pp_setup
+        now = (self.selected_map(), self.wp_cb.currentData())
+        if (pp_map, pp_wp) != now:
+            return ('화면에서 고른 맵·웨이포인트와 켜져 있는 자율주행의 설정이 달라요.\n'
+                    f'자율주행: {map_label(pp_map)} / {os.path.basename(pp_wp or "") or "없음"}\n'
+                    f'화면: {map_label(now[0])} / {os.path.basename(now[1] or "") or "없음"}\n'
+                    '자율주행을 끄고 다시 켜세요.')
+        if pp_map != self.loc_map:
+            return (f'자율주행은 {map_label(pp_map)}, 위치 추정은 {map_label(self.loc_map)} 맵이에요.\n'
+                    '같은 맵으로 맞춘 뒤 자율주행을 다시 켜세요.')
+        return waypoint_problem(self.map_cb.currentText(), pp_wp)
 
     def save_map(self):
         if not self.procs['slam'].running():
@@ -511,6 +653,19 @@ class Panel(QtWidgets.QWidget):
         self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()}')
         self.tabs.setCurrentWidget(self.procs['editor'].log)
 
+    def edit_map(self):
+        if not self.selected_map():
+            return self.warn('맵이 없어요.')
+        pr = self.procs['map_editor']
+        if pr.running():
+            return self.warn('맵 편집기가 이미 열려 있어요. 닫은 뒤 다시 눌러 주세요.')
+        cmd = f'ros2 run waypoint_nav map_editor {self.selected_map()}'
+        # show the route only if it was made for this map
+        if self.wp_cb.currentText().startswith(self.map_cb.currentText()):
+            cmd += f' --waypoints {self.wp_cb.currentData()}'
+        pr.start(cmd)
+        self.tabs.setCurrentWidget(pr.log)
+
     def relocalize(self):
         if not self.procs['localize'].running():
             return self.warn('위치 추정이 켜져 있어야 해요.')
@@ -525,6 +680,9 @@ class Panel(QtWidgets.QWidget):
         # the car still under the autonomous commands
         if self.manual:
             self.toggle_manual()
+        problem = self.drive_problem() if self.procs['pp'].running() else None
+        if problem:
+            return self.warn(problem)
         self.ros.pp('go')
 
     def toggle_manual(self):
@@ -618,7 +776,7 @@ class Panel(QtWidgets.QWidget):
         def put(k, text, ok):
             color = {True: '#2e7d32', False: '#c62828', None: '#f9a825'}[ok]
             self.st[k].setText(text)
-            self.st[k].setStyleSheet(f'padding:4px 8px; border-radius:4px; background:{color}; color:white')
+            self.st[k].setStyleSheet(f'{STATUS_CARD} background:{color}')
         fresh = r.core is not None and now - r.core_t < 1.0
         if fresh:
             v = r.core.voltage_input
@@ -628,22 +786,22 @@ class Panel(QtWidgets.QWidget):
                 self.rest_v += 0.03 * (v - self.rest_v)   # ~10 s time constant at this 0.3 s timer
             cells = self.cells_cb.currentData()
             soc = 5 * round(battery_percent(self.rest_v, cells) / 5)   # VESC reads in 0.1 V: about 5 % steps
-            put('battery', f'배터리 {v:.1f} V · 약 {soc}%',
+            put('battery', f'{v:.1f} V\n약 {soc}%',
                 True if v >= 3.7 * cells else (None if v >= 3.5 * cells else False))
-            put('vesc', f'VESC fault {r.core.fault_code}', r.core.fault_code == 0)
-            put('speed', f'속도 {r.core.speed / ERPM_GAIN:+.2f} m/s', True)
+            put('vesc', f'fault {r.core.fault_code}', r.core.fault_code == 0)
+            put('speed', f'{r.core.speed / ERPM_GAIN:+.2f}\nm/s', True)
         else:
             self.rest_v = None   # VESC off: the pack may be swapped before it returns
-            put('battery', '배터리 -', False)
-            put('vesc', 'VESC 연결 없음', False)
-            put('speed', '속도 -', False)
+            put('battery', '-', False)
+            put('vesc', '연결 없음', False)
+            put('speed', '-', False)
         hz = len(r.scan_times)
-        put('lidar', f'라이다 {hz} Hz', True if hz >= 30 else (None if hz > 0 else False))
+        put('lidar', f'{hz} Hz', True if hz >= 30 else (None if hz > 0 else False))
         pose = r.pose()
         if pose:
-            put('pose', f'위치 ({pose[0]:.1f}, {pose[1]:.1f}) {math.degrees(pose[2]):.0f}°', True)
+            put('pose', f'({pose[0]:.1f}, {pose[1]:.1f})\n{math.degrees(pose[2]):.0f}°', True)
         else:
-            put('pose', '위치 없음 (SLAM/위치 추정)', None)
+            put('pose', '없음', None)
         joy_on = self.procs['joy'].running()
         joy_live = joy_on and now - r.joy_t < 1.0
         self.joy_label.setText(('입력 수신 중' if joy_live else '⚠ 패드 입력 없음 (연결·전원 확인)')
@@ -669,12 +827,12 @@ class Panel(QtWidgets.QWidget):
         self.pp_btn.setText('자율주행 끄기' if pp_on else '자율주행 준비')
         self.go_btn.setEnabled(pp_on and not self.estop)
         self.stop_btn.setEnabled(pp_on)
-        self.manual_btn.setText('키보드 조종 끄기' if self.manual else '키보드 조종 켜기')
+        self.manual_btn.setText('키보드 끄기' if self.manual else '키보드 켜기')
         self.manual_btn.setStyleSheet('background:#1565c0; color:white' if self.manual else '')
         if not self.manual:
             self.manual_label.setText('꺼짐 (켜면 자율주행보다 우선)')
         joy_on = self.procs['joy'].running()
-        self.joy_btn.setText('조이스틱 조종 끄기' if joy_on else '조이스틱 조종 켜기')
+        self.joy_btn.setText('조이스틱 끄기' if joy_on else '조이스틱 켜기')
         self.joy_btn.setStyleSheet('background:#1565c0; color:white' if joy_on else '')
         self.estop_btn.setText('긴급 정지 해제' if self.estop else '긴급 정지')
         self.estop_btn.setStyleSheet(
@@ -700,12 +858,21 @@ class Panel(QtWidgets.QWidget):
         ev.accept()
 
 
-def main():
-    app = QtWidgets.QApplication(sys.argv)
+def apply_style(app):
     font = app.font()
     font.setPointSizeF(font.pointSizeF() * FONT_SCALE)
     app.setFont(font)
-    app.setStyleSheet('QPushButton { padding: 1px 6px; }')
+    # the card border is drawn here so the layout margins measure from it: with the platform
+    # style, tight margins let buttons and combo boxes stick out past the border
+    app.setStyleSheet('QPushButton { padding: 1px 6px; }'
+                      'QGroupBox { border: 1px solid palette(mid); border-radius: 5px;'
+                      ' margin-top: 1.2em; }'
+                      'QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 2px; }')
+
+
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    apply_style(app)
     w = Panel()
     # rclpy.init (inside Panel) installs its own SIGINT/SIGTERM handlers that only shut the
     # ROS context down and leave the Qt window running: make Ctrl+C / kill end the process

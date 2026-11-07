@@ -5,6 +5,8 @@ log/
 
 # driving records (pure_pursuit run_log_dir)
 runs/
+# copies of the control panel log tabs
+logs/
 
 # slam_toolbox pose graphs are large and stay on this Jetson
 maps/*.data
