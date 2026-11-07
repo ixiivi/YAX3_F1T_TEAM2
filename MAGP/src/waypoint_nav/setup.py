@@ -19,6 +19,7 @@ setup(
     entry_points={
         'console_scripts': [
             'waypoint_editor = waypoint_nav.waypoint_editor:main',
+            'map_editor = waypoint_nav.map_editor:main',
             'pure_pursuit = waypoint_nav.pure_pursuit:main',
             'rviz_waypoints = waypoint_nav.rviz_waypoints:main',
             'global_localize = waypoint_nav.global_localize:main',
