@@ -4,13 +4,19 @@
 Usage:
   ros2 run waypoint_nav waypoint_editor <map.yaml> [--out name.csv] [--vmax 3.0] [--alat 2.0]
 
+An existing CSV for this map opens ready to edit, with a point about every metre and more
+in tight corners.
+
 Mouse / keys (in the map window):
-  left click, a  add point (a = at the mouse cursor, for remote desktops)
-  right click/z  remove last point
+  left click, a  add point at the end (a = at the mouse cursor, for remote desktops)
+  drag a point   move it; the path follows while dragging
+  drag the path  add a point there and move it
+  right click    remove the point under the cursor
+  z              undo
   c              toggle closed loop (lap) / open path
   enter          smooth, compute speeds, save CSV + preview PNG
-  r              clear all points
-  q / esc        quit
+  r              clear all points (z brings them back)
+  q / esc        quit without saving
 
 CSV format (same as the legacy race_stack): x,y,speed  in the map frame [m, m, m/s].
 """
@@ -26,9 +32,13 @@ import numpy as np  # noqa: E402
 import yaml  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from waypoint_nav.path_tools import smooth_path, speed_profile, write_csv  # noqa: E402
+from waypoint_nav.path_tools import (distance_to_polyline, handles_from_path,  # noqa: E402
+                                     read_csv, smooth_path, speed_profile, write_csv)
 
 WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
+GRAB_POINT = 10     # screen pixels: a press this close grabs a point
+GRAB_PATH = 6       # screen pixels: a press this close to the path adds a point there
+DRAG_START = 3      # screen pixels: less movement than this is a click, not a drag
 
 
 def load_map(yaml_path):
@@ -50,6 +60,16 @@ def world_to_px(x, y, h, res, origin):
     return (x - origin[0]) / res - 0.5, h - (y - origin[1]) / res - 0.5
 
 
+def insert_index(pts, p, closed):
+    """Where a new point p fits in the list: the place that adds the least path length."""
+    pts = np.asarray(pts, dtype=float)
+    a = pts if closed else pts[:-1]
+    b = np.roll(pts, -1, axis=0) if closed else pts[1:]
+    detour = (np.linalg.norm(p - a, axis=1) + np.linalg.norm(p - b, axis=1)
+              - np.linalg.norm(b - a, axis=1))
+    return int(detour.argmin()) + 1
+
+
 class Editor:
     def __init__(self, yaml_path, out_name, args):
         self.img, self.res, self.origin = load_map(yaml_path)
@@ -59,6 +79,15 @@ class Editor:
         self.out_name = out_name or f'{self.map_name}_wp.csv'
         self.pts = []           # world coordinates
         self.closed = True
+        self.history = []       # point lists to go back to with undo
+        self.drag = None        # index of the point held by the mouse
+        self.drag_from = None   # screen position of that press, until the drag really starts
+        self.dirty = False
+        out = os.path.join(WP_DIR, self.out_name)
+        if os.path.exists(out):
+            handles, self.closed = handles_from_path(read_csv(out))
+            self.pts = [tuple(p) for p in handles]
+            print(f'opened {out}: {len(self.pts)} points', flush=True)
         # free our keys from matplotlib's defaults (c = back, r = home, a/z/s ...)
         for name in [k for k in plt.rcParams if k.startswith('keymap.')]:
             plt.rcParams[name] = [k for k in plt.rcParams[name]
@@ -66,9 +95,12 @@ class Editor:
         self.fig, self.ax = plt.subplots(figsize=(10, 10))
         self.ax.imshow(self.img, cmap='gray', origin='upper')
         self._crop_to_known_area()
-        self.click_line, = self.ax.plot([], [], 'o-', color='tab:blue', ms=5, lw=1)
+        self.curve_line, = self.ax.plot([], [], '-', color='tab:orange', lw=1.5)
+        self.click_line, = self.ax.plot([], [], 'o', color='tab:blue', ms=7, mec='white', mew=0.8)
         self.path_line = None
         self.fig.canvas.mpl_connect('button_press_event', self.on_click)
+        self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
+        self.fig.canvas.mpl_connect('button_release_event', self.on_release)
         self.fig.canvas.mpl_connect('key_press_event', self.on_key)
         self.redraw()
 
@@ -82,50 +114,126 @@ class Editor:
 
     def title(self, msg=''):
         mode = 'closed loop' if self.closed else 'open path'
-        self.ax.set_title(f'{self.map_name}  |  {len(self.pts)} pts  |  {mode}  (c: toggle)\n'
-                          f'left click or a: add  right/z: undo  enter: save  r: reset  q: quit   {msg}')
+        changed = '  |  * not saved' if self.dirty else ''
+        self.ax.set_title(f'{self.map_name}  |  {len(self.pts)} pts  |  {mode}  (c: toggle){changed}\n'
+                          'click/a: add  drag: move  right: remove  z: undo  '
+                          f'enter: save  r: reset  q: quit   {msg}')
+
+    def curve(self):
+        """The path as it would be saved, or straight lines while it cannot be smoothed yet."""
+        if not self.pts:
+            return np.empty((0, 2))
+        straight = np.array(self.pts + self.pts[:1] if self.closed else self.pts)
+        if len(self.pts) < (3 if self.closed else 2):
+            return straight
+        try:
+            xy, _ = smooth_path(self.pts, self.closed)
+        except (ValueError, TypeError):   # e.g. two points on the same spot during a drag
+            return straight
+        if not np.isfinite(xy).all():
+            return straight
+        return np.vstack([xy, xy[:1]]) if self.closed else xy
+
+    def to_px(self, xy):
+        return np.array([world_to_px(x, y, self.h, self.res, self.origin) for x, y in xy]).reshape(-1, 2)
 
     def redraw(self, msg=''):
-        if self.pts:
-            px = [world_to_px(x, y, self.h, self.res, self.origin) for x, y in self.pts]
-            u, v = zip(*px)
-            self.click_line.set_data(u, v)
-        else:
-            self.click_line.set_data([], [])
+        px = self.to_px(self.pts)
+        self.click_line.set_data(px[:, 0], px[:, 1])
+        curve = self.to_px(self.curve())
+        self.curve_line.set_data(curve[:, 0], curve[:, 1])
         self.title(msg)
         self.fig.canvas.draw_idle()
+
+    def remember(self):
+        """Call before any change to the points: makes it undoable and clears the saved view."""
+        self.history.append(list(self.pts))
+        self.dirty = True
+        if self.path_line:
+            self.path_line.remove()   # the speed colours belong to the path as it was saved
+            self.path_line = None
+
+    def undo(self):
+        if self.history:
+            self.pts = self.history.pop()
+            self.dirty = True
+            self.drag = None
+
+    def event_world(self, ev):
+        return px_to_world(ev.xdata, ev.ydata, self.h, self.res, self.origin)
+
+    def point_at(self, ev):
+        """Index of the point under the mouse, or None."""
+        if not self.pts:
+            return None
+        screen = self.ax.transData.transform(self.to_px(self.pts))
+        d = np.linalg.norm(screen - (ev.x, ev.y), axis=1)
+        return int(d.argmin()) if d.min() <= GRAB_POINT else None
+
+    def on_path(self, ev):
+        if len(self.pts) < 2:
+            return False
+        screen = self.ax.transData.transform(self.to_px(self.curve()))
+        return distance_to_polyline(np.array((ev.x, ev.y)), screen) <= GRAB_PATH
 
     def add_point(self, ev):
         if ev.inaxes != self.ax or ev.xdata is None:
             return
-        self.pts.append(px_to_world(ev.xdata, ev.ydata, self.h, self.res, self.origin))
+        self.remember()
+        self.pts.append(self.event_world(ev))
         x, y = self.pts[-1]
         print(f'point {len(self.pts)}: ({x:.2f}, {y:.2f}) m', flush=True)
 
     def on_click(self, ev):
         print(f'[mouse] button={ev.button} in_map={ev.inaxes == self.ax} '
               f'tool={self.fig.canvas.toolbar.mode or "none"}', flush=True)
-        if self.fig.canvas.toolbar.mode:
+        if self.fig.canvas.toolbar.mode or ev.inaxes != self.ax:
             return  # ignore clicks while zoom/pan tool is active
+        hit = self.point_at(ev)
         if ev.button == 3:
-            if self.pts:
-                self.pts.pop()
-        else:
-            self.add_point(ev)
+            if hit is not None:
+                self.remember()
+                del self.pts[hit]
+        elif ev.button == 1:
+            if hit is not None:
+                self.drag, self.drag_from = hit, (ev.x, ev.y)
+            elif self.on_path(ev):
+                # the new point is held right away: it starts on the path and follows the mouse
+                self.remember()
+                self.drag = insert_index(self.pts, self.event_world(ev), self.closed)
+                self.pts.insert(self.drag, self.event_world(ev))
+            else:
+                self.add_point(ev)
         self.redraw()
+
+    def on_motion(self, ev):
+        if self.drag is None or ev.inaxes != self.ax or ev.xdata is None:
+            return
+        if self.drag_from is not None:
+            if np.hypot(ev.x - self.drag_from[0], ev.y - self.drag_from[1]) < DRAG_START:
+                return
+            self.drag_from = None
+            self.remember()
+        self.pts[self.drag] = self.event_world(ev)
+        self.redraw()
+
+    def on_release(self, ev):
+        if self.drag is not None and self.drag_from is None:
+            x, y = self.pts[self.drag]
+            print(f'point {self.drag + 1}: moved to ({x:.2f}, {y:.2f}) m', flush=True)
+        self.drag = self.drag_from = None
 
     def on_key(self, ev):
         if ev.key == 'a':
             self.add_point(ev)
-        elif ev.key == 'z' and self.pts:
-            self.pts.pop()
+        elif ev.key == 'z':
+            self.undo()
         elif ev.key == 'c':
+            self.remember()
             self.closed = not self.closed
         elif ev.key == 'r':
+            self.remember()
             self.pts = []
-            if self.path_line:
-                self.path_line.remove()
-                self.path_line = None
         elif ev.key == 'enter':
             self.save()
             return
@@ -140,7 +248,14 @@ class Editor:
             self.redraw(f'need at least {need} points')
             return
         a = self.args
-        xy, length = smooth_path(self.pts, self.closed)
+        try:
+            xy, length = smooth_path(self.pts, self.closed)
+        except (ValueError, TypeError):
+            self.redraw('cannot smooth: two points are on the same spot')
+            return
+        if not np.isfinite(xy).all():
+            self.redraw('cannot smooth: two points are on the same spot')
+            return
         v = speed_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon)
         os.makedirs(WP_DIR, exist_ok=True)
         out = os.path.join(WP_DIR, self.out_name)
@@ -151,6 +266,7 @@ class Editor:
         self.path_line = self.ax.scatter(px[:, 0], px[:, 1], c=v, cmap='turbo', s=6,
                                          vmin=a.vmin, vmax=a.vmax)
         self.fig.savefig(out.replace('.csv', '.png'), dpi=120, bbox_inches='tight')
+        self.dirty = False
         msg = f'saved {len(xy)} pts, {length:.1f} m, v {v.min():.2f}..{v.max():.2f} m/s'
         print(f'{msg} -> {out}', flush=True)
         self.redraw(msg)
