@@ -390,7 +390,8 @@ class PurePursuit(Node):
         else:
             R = 1.0 / k  # turn centre at (0, R)
             lat = np.abs(np.hypot(x, y - R) - abs(R))
-            s = abs(R) * np.arctan2(x / R, (R - y) / R)
+            # angle swept around the centre; dividing x by R would flip it for right turns
+            s = abs(R) * np.arctan2(x, (R - y) * math.copysign(1.0, R))
         hit = (lat < self.aeb_half_width) & (s > 0.0) & (s < reach)
         return float(s[hit].min()) if hit.any() else None
 
