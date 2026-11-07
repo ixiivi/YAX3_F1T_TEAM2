@@ -123,6 +123,8 @@ class PurePursuit(Node):
         p('lost_time', 0.3)          # ... for this long [s] = localization lost
         p('resume_fit', 0.6)         # needed after relocalizing to drive on
         p('accept_fit', 0.75)        # a local re-search result is trusted from this fit on
+        p('global_min_gain', 0.10)   # a far-away global result must fit this much better than the
+                                     # nearby one: along a straight many far spots fit about as well
         p('reverse_enabled', True)
         p('reverse_dist', 0.4)       # [m] back along the driven track, times the attempt number
         p('reverse_speed', 1.0)      # [m/s]
@@ -136,8 +138,9 @@ class PurePursuit(Node):
         p('progress_dist', 1.0)      # [m] driven past the trouble spot for it to count as progress
         p('retry_wait', 5.0)         # [s] blocked this long after max_attempts: back up again
         # hit detection, LiDAR only: wheels can spin freely against a wall, so odometry cannot tell
-        p('hit_start_grace', 1.5)    # [s] after a start: the motor may take a moment to get going
-        p('contact_band', 0.05)      # [m] points this close to the body count as contact ...
+        # measured on the floor 2026-11-07: 0.5 m/s took 1.3 s to get going, after failed tries
+        p('hit_start_grace', 2.5)    # [s] after a start, before a frozen scan counts as a hit
+        p('contact_band', 0.03)      # [m] points this close to the body count as contact ...
         p('contact_points', 3)       # ... at least this many, on two scans in a row ...
         p('contact_wall_dist', 0.25) # ... and this close to a map wall (a car is not a wall)
         p('frozen_change', 0.08)     # [m] a beam changed if its range moved more than this
@@ -235,6 +238,8 @@ class PurePursuit(Node):
         self.frozen_ref, self.frozen_since = None, time.monotonic()
         self.scan_change = 0.0            # fraction of beams changed since frozen_ref
         self.go_t = time.monotonic()
+        self.skip_search = False          # this recovery only backs up: the pose was fine
+        self.rev_blind = False            # backing up without a driven track to retrace
         self.wait_since = None            # blocked with no reverse attempts left, since when
         self.wait_t0 = 0.0
         self.verify_at = 0.0
@@ -649,15 +654,27 @@ class PurePursuit(Node):
         self.attempts += 1
         odom = self.lookup('odom')
         self.trouble_at = odom
-        if self.gp('reverse_enabled') and odom and len(self.trail) >= 3:
+        # stopped or hit with the scan still fitting the map: the pose is fine, and searching for
+        # it again only costs time and can move it to a similar spot further along a straight
+        pose_ok = hit and self.fit is not None and self.fit >= self.gp('resume_fit')
+        tries = f'(시도 {self.attempts}/{self.gp("max_attempts")})'
+        # right after a start there is no driven track yet: a hit may still back straight out
+        no_track = len(self.trail) < 3
+        if self.gp('reverse_enabled') and odom and (not no_track or hit):
             self.mode = 'reverse'
+            self.skip_search = pose_ok
+            self.rev_blind = no_track
             self.rev_start, self.rev_t0, self.rev_last = None, time.monotonic(), odom
-            self.event(f'복구 시작 ({reason}) → 지나온 길로 후진 후 위치 재설정 '
-                       f'(시도 {self.attempts}/{self.gp("max_attempts")})')
+            then = '바로 재출발' if pose_ok else '위치 재설정'
+            self.event(f'복구 시작 ({reason}) → 지나온 길로 후진 후 {then} {tries}')
+        elif pose_ok:
+            self.mode = 'wait'
+            self.wait_t0 = time.monotonic()
+            self.wait_since = self.wait_since or self.wait_t0
+            self.event(f'복구 시작 ({reason}) → 후진할 수 없어 길이 열릴 때까지 대기 {tries}')
         else:
             self.mode = 'search'
-            self.event(f'복구 시작 ({reason}) → 위치 재설정 '
-                       f'(시도 {self.attempts}/{self.gp("max_attempts")})')
+            self.event(f'복구 시작 ({reason}) → 위치 재설정 {tries}')
 
     def step_wait(self, pose):
         self.drive(0.0, 0.0)
@@ -698,21 +715,30 @@ class PurePursuit(Node):
         while self.trail and math.hypot(ox - self.trail[-1][0], oy - self.trail[-1][1]) < 0.3:
             self.trail.pop()
         why = None
-        if moved >= self.gp('reverse_dist') * self.attempts:
+        # without a driven track the space behind was never seen free: never back up further
+        far = self.gp('reverse_dist') * (1 if self.rev_blind else self.attempts)
+        if moved >= far:
             why = f'{moved:.2f} m'
         elif time.monotonic() - self.rev_t0 > self.gp('reverse_timeout'):
             why = 'timeout'
-        elif not self.trail:
+        elif not self.trail and not self.rev_blind:
             why = 'end of track'
         elif self.rear_blocked():
             why = 'something behind'
         if why:
             self.stop(f'reverse done ({why})')
-            self.mode = 'search'
+            if self.skip_search:
+                self.event(f'후진 완료 ({why}) → 재출발')
+                self.recovered_at = odom
+                self.go()
+            else:
+                self.mode = 'search'
             return
-        tx, ty = self.trail[-1]
         # retrace the track, turning towards parallel with the side wall
-        steer = self.pursuit_steer(ox, oy, oyaw, tx, ty) - self.gp('align_gain') * self.wall_angle()
+        steer = -self.gp('align_gain') * self.wall_angle()
+        if self.trail:
+            tx, ty = self.trail[-1]
+            steer += self.pursuit_steer(ox, oy, oyaw, tx, ty)
         steer = self.clamp_steer(steer)
         v = self.floor(-self.gp('reverse_speed'), steer)
         self.status = f'reverse {moved:.2f} m st {steer:+.2f}'
@@ -750,15 +776,26 @@ class PurePursuit(Node):
     def _search(self, scan, guess):
         r, a = self.rays(scan, 3)
         ok = lambda res: self.matcher.fit(*res[1:], r, a) >= self.gp('accept_fit')  # noqa: E731
-        res = None
+        near = None
         if guess is not None:
             # near the (wrong) estimate first: quick, and right when AMCL only slipped a bit.
             # Judge it by the strict fit, the soft score also likes wrong places nearby
-            res = self.matcher.local_search(*guess, r, a)
+            near = self.matcher.local_search(*guess, r, a)
+        res = near
         if res is None or not ok(res):
             res = self.matcher.global_search(*self.rays(scan, 6))
             # the global grid is coarse: polish around its answer with the denser scan
             res = max(res, self.matcher.local_search(*res[1:], r, a, radius=0.3, yaw_range_deg=6))
+            if near is not None and math.hypot(res[1] - near[1], res[2] - near[2]) > 0.5:
+                # the far answer has to earn the jump
+                far_fit = self.matcher.fit(*res[1:], r, a)
+                near_fit = self.matcher.fit(*near[1:], r, a)
+                if far_fit < near_fit + self.gp('global_min_gain'):
+                    self.get_logger().info(
+                        f'relocalize: kept the nearby pose ({near_fit * 100:.0f}%) over one '
+                        f'{math.hypot(res[1] - near[1], res[2] - near[2]):.1f} m away '
+                        f'({far_fit * 100:.0f}%)')
+                    res = near
         fit = self.matcher.fit(*res[1:], r, a)
         if guess is not None:
             dyaw = math.atan2(math.sin(res[3] - guess[2]), math.cos(res[3] - guess[2]))
