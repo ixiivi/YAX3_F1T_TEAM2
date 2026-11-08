@@ -51,6 +51,13 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   base_frame_("base_link"),
   use_servo_cmd_(true),
   publish_tf_(false),
+  use_imu_yaw_(false),
+  imu_gyro_scale_(M_PI / 180.0),
+  imu_gyro_bias_(0.0),
+  imu_bias_alpha_(0.01),
+  imu_timeout_(0.2),
+  last_gyro_(0.0),
+  have_gyro_(false),
   x_(0.0),
   y_(0.0),
   yaw_(0.0)
@@ -73,6 +80,12 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
 
   publish_tf_ = declare_parameter("publish_tf", publish_tf_);
 
+  use_imu_yaw_ = declare_parameter("use_imu_for_yaw", use_imu_yaw_);
+  imu_gyro_scale_ = declare_parameter("imu_gyro_scale", imu_gyro_scale_);
+  imu_gyro_bias_ = declare_parameter("imu_gyro_bias", imu_gyro_bias_);
+  imu_bias_alpha_ = declare_parameter("imu_bias_alpha", imu_bias_alpha_);
+  imu_timeout_ = declare_parameter("imu_timeout", imu_timeout_);
+
   // create odom publisher
   odom_pub_ = create_publisher<Odometry>("odom", 10);
 
@@ -88,6 +101,12 @@ VescToOdom::VescToOdom(const rclcpp::NodeOptions & options)
   if (use_servo_cmd_) {
     servo_sub_ = create_subscription<Float64>(
       "sensors/servo_position_command", 10, std::bind(&VescToOdom::servoCmdCallback, this, _1));
+  }
+  if (use_imu_yaw_) {
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+      "sensors/imu/raw", 20, std::bind(&VescToOdom::imuCallback, this, _1));
+    RCLCPP_INFO(get_logger(), "yaw rate from the IMU gyro (bias start %.2f, scale %.5f)",
+      imu_gyro_bias_, imu_gyro_scale_);
   }
 }
 
@@ -107,6 +126,18 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
       (last_servo_cmd_->data - steering_to_servo_offset_) / steering_to_servo_gain_;
     current_angular_velocity = current_speed * tan(current_steering_angle) / wheelbase_;
   }
+  if (use_imu_yaw_ && have_gyro_ && (now() - last_gyro_time_).seconds() < imu_timeout_) {
+    if (current_speed == 0.0) {
+      // standing still: the car cannot turn, so whatever the gyro reads is its bias
+      imu_gyro_bias_ += imu_bias_alpha_ * (last_gyro_ - imu_gyro_bias_);
+      current_angular_velocity = 0.0;
+    } else {
+      current_angular_velocity = (last_gyro_ - imu_gyro_bias_) * imu_gyro_scale_;
+    }
+  } else if (use_imu_yaw_) {
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+      "no fresh IMU gyro data: yaw rate from the servo command meanwhile");
+  }
 
   // use current state as last state if this is our first time here
   if (!last_state_) {
@@ -123,7 +154,7 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
   double y_dot = current_speed * sin(yaw_);
   x_ += x_dot * dt.seconds();
   y_ += y_dot * dt.seconds();
-  if (use_servo_cmd_) {
+  if (use_servo_cmd_ || use_imu_yaw_) {
     yaw_ += current_angular_velocity * dt.seconds();
   }
 
@@ -181,6 +212,13 @@ void VescToOdom::vescStateCallback(const VescStateStamped::SharedPtr state)
 void VescToOdom::servoCmdCallback(const Float64::SharedPtr servo)
 {
   last_servo_cmd_ = servo;
+}
+
+void VescToOdom::imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu)
+{
+  last_gyro_ = imu->angular_velocity.z;
+  last_gyro_time_ = now();
+  have_gyro_ = true;
 }
 
 }  // namespace vesc_ackermann

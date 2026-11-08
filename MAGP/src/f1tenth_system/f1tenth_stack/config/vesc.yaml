@@ -2,13 +2,19 @@
   # general parameters shared by all vesc-related nodes
   ros__parameters:
     # erpm (electrical rpm) = speed_to_erpm_gain * speed (meters / second) + speed_to_erpm_offset
-    speed_to_erpm_gain: 4614.0
+    # measured 2026-11-08: three taped 2.00 m drives read 1.859 / 1.880 / 1.922 m on odometry
+    # at 4614 (LiDAR 2.04 / 1.98 / 2.01 m): 4614 * mean / 2.00 = 4353, spread about 1.7%
+    speed_to_erpm_gain: 4353.0
     speed_to_erpm_offset: 0.0
 
     # servo value (0 to 1) =  steering_angle_to_servo_gain * steering angle (radians) + steering_angle_to_servo_offset
-    steering_angle_to_servo_gain: -1.2135
+    # measured 2026-11-08 against the VESC IMU gyro: the wheels turned about 25% more than
+    # -1.2135 assumed, so odom yaw lagged in corners and steering overshot. Two circle runs
+    # (49 and 93 steady windows) fit -0.983 / -0.984 with offset 0.504
+    steering_angle_to_servo_gain: -0.98
     # stock 0.5304 drifted slightly right, 0.4697 slightly left -> midpoint (2026-11-01)
-    steering_angle_to_servo_offset: 0.500
+    # 2026-11-08: both circle fits and three straight drives put straight ahead at 0.504
+    steering_angle_to_servo_offset: 0.504
 
     # |speed| below this (m/s) -> brake current instead of speed control (0 disables)
     brake_below_speed: 0.3
@@ -39,6 +45,11 @@ vesc_to_odom_node:
     # publish odom to base link tf
     publish_tf: true
     use_servo_cmd_to_calc_angular_velocity: true
+    # yaw rate from the VESC IMU gyro instead (2026-11-08): above 2 m/s tyre slip and servo lag
+    # made the servo estimate turn 38% too much in corners; replaying a 3 m/s run, the total
+    # turn error went from +9.4% to -1.4%. The servo estimate stays as fallback without IMU.
+    use_imu_for_yaw: true
+    imu_gyro_bias: 2.44        # [deg/s] start value; re-estimated whenever the car stands still
     # measured 2026-11-03 (stock config said 25 cm)
     wheelbase: 0.33
 

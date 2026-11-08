@@ -38,6 +38,7 @@
 
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <std_msgs/msg/float64.hpp>
 #include <vesc_msgs/msg/vesc_state_stamped.hpp>
 
@@ -67,6 +68,16 @@ private:
 
   // odometry state
   double x_, y_, yaw_;
+  /** Yaw rate from the IMU gyro instead of the servo command (tyre slip and servo lag make the
+   *  servo estimate turn too much above about 2 m/s) */
+  bool use_imu_yaw_;
+  double imu_gyro_scale_;   ///< gyro unit to rad/s (the VESC driver reports deg/s)
+  double imu_gyro_bias_;    ///< in gyro units; re-estimated whenever the car stands still
+  double imu_bias_alpha_;   ///< low-pass weight of one standing-still sample in the bias
+  double imu_timeout_;      ///< [s] older gyro data falls back to the servo estimate
+  double last_gyro_;
+  rclcpp::Time last_gyro_time_;
+  bool have_gyro_;
   Float64::SharedPtr last_servo_cmd_;  ///< Last servo position commanded value
   VescStateStamped::SharedPtr last_state_;  ///< Last received state message
 
@@ -74,11 +85,13 @@ private:
   rclcpp::Publisher<Odometry>::SharedPtr odom_pub_;
   rclcpp::Subscription<VescStateStamped>::SharedPtr vesc_state_sub_;
   rclcpp::Subscription<Float64>::SharedPtr servo_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   std::shared_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
 
   // ROS callbacks
   void vescStateCallback(const VescStateStamped::SharedPtr state);
   void servoCmdCallback(const Float64::SharedPtr servo);
+  void imuCallback(const sensor_msgs::msg::Imu::SharedPtr imu);
 };
 
 }  // namespace vesc_ackermann
