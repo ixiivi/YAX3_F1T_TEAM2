@@ -12,13 +12,14 @@ With map_yaml set:
   * obstacle bypass: scan points that are not on the map are obstacles; the path is shifted
     sideways (never against the driving direction) just enough to pass them with clearance,
     and comes back to the line afterwards.
-  * recovery: when the LiDAR says the car hit something (points right at the body next to a map
-    wall, or the scan stopped changing although it should drive) or the scan stops fitting the
-    map (localization lost), the car brakes to a stop, backs up along the track it just drove
-    (that space was free a moment ago; the rear is a LiDAR blind spot) while turning parallel to
-    the nearby wall, finds its pose by scan matching, hands it to AMCL and drives on. Each
-    attempt without progress backs up further; after max_attempts it stops backing up: it waits
-    until the way is free, or keeps searching for its pose. It never gives up by itself.
+  * relocalization: when the scan stops fitting the map (localization lost) or the pose is far
+    off the path, the car stops, finds its pose by scan matching, hands it to AMCL and drives
+    on. It never backs up for this.
+  * hit recovery (reverse_enabled): when the LiDAR sees a map wall right at the front wheels or
+    the bumper, the car brakes, backs up along the track it just drove (that space was free a
+    moment ago; the rear is a LiDAR blind spot) while turning parallel to the nearby wall, and
+    drives on. Each attempt without progress backs up further; after max_attempts it waits
+    until the way is free. With reverse_enabled off there is no hit detection at all.
 It also stops by itself when the pose is stale, something is on the arc it is about to drive
 (AEB), no bypass is free, or the end of an open path is reached.
 
@@ -112,6 +113,13 @@ class PurePursuit(Node):
         # scan points further than this from any map wall are obstacles; generous, because a few
         # cm of AMCL error already moves wall points off the mapped walls
         p('obstacle_min_map_dist', 0.25)
+        # pose skew self-correction (legacy race_stack): when the pose is off, every wall return
+        # lands off the mapped walls and turns into an obstacle. The median distance of the scan
+        # points to the walls measures that offset on every scan; the threshold is raised by it.
+        # 2026-11-08 at 3 m/s: map fit < 0.6 gave a median of 88-152 "obstacles" and 31% BLOCKED,
+        # fit > 0.8 gave none. Real obstacles are few points, so they barely move the median.
+        p('skew_gain', 1.0)          # 0 = off
+        p('skew_max', 0.35)          # [m] cap on the added threshold
         # localization recovery
         p('recovery_enabled', True)
         # below this fit while driving, search near the pose and hand the better one to AMCL
@@ -119,8 +127,12 @@ class PurePursuit(Node):
         p('track_fit', 0.7)
         p('track_radius', 0.5)       # [m] search window around the pose at scan time
         p('track_yaw_deg', 15.0)     # [deg]
-        p('lost_fit', 0.45)          # scan fraction on map walls below this ...
-        p('lost_time', 0.3)          # ... for this long [s] = localization lost
+        # a person or an obstacle in front of the LiDAR drops the fit for a moment while the pose
+        # is still right (in the logs most stops found the pose within 5 cm): judge over 1 s
+        p('lost_fit', 0.30)          # scan fraction on map walls below this ...
+        p('lost_time', 1.0)          # ... for this long [s] = localization lost
+        # bypassing shifts the car up to avoid_max_offset off the line, plus pose error in corners
+        p('off_path_limit', 1.5)     # [m] further than this from the path = localization lost
         p('resume_fit', 0.6)         # needed after relocalizing to drive on
         p('accept_fit', 0.75)        # a local re-search result is trusted from this fit on
         p('global_min_gain', 0.10)   # a far-away global result must fit this much better than the
@@ -138,15 +150,14 @@ class PurePursuit(Node):
         p('progress_dist', 1.0)      # [m] driven past the trouble spot for it to count as progress
         p('retry_wait', 5.0)         # [s] blocked this long after max_attempts: back up again
         # hit detection, LiDAR only: wheels can spin freely against a wall, so odometry cannot tell
-        # measured on the floor 2026-11-07: 0.5 m/s took 1.3 s to get going, after failed tries
-        p('hit_start_grace', 2.5)    # [s] after a start, before a frozen scan counts as a hit
         p('contact_band', 0.03)      # [m] points this close to the body count as contact ...
+        p('contact_front_x', 0.25)   # ... only from here forward [m]: front wheels (axle 0.33,
+                                     # minus a wheel radius) and the bumper
         p('contact_points', 3)       # ... at least this many, on two scans in a row ...
         p('contact_wall_dist', 0.25) # ... and this close to a map wall (a car is not a wall)
+        # logged only (scan_change, frozen_s): shows a car stuck without a visible contact
         p('frozen_change', 0.08)     # [m] a beam changed if its range moved more than this
         p('frozen_fraction', 0.04)   # below this fraction of changed beams the scan is frozen
-        p('frozen_time', 0.5)        # [s] frozen while commanding speed = hit
-        p('frozen_stop_time', 1.0)   # [s] frozen while AEB or BLOCKED holds the car = hit
         p('run_log_dir', '~/MAGP/MAGP/runs')  # CSV record of each run; empty = off
         p('run_log_rate', 10.0)      # [Hz]
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -237,7 +248,6 @@ class PurePursuit(Node):
         self.contact_scans = 0            # scans in a row with contact
         self.frozen_ref, self.frozen_since = None, time.monotonic()
         self.scan_change = 0.0            # fraction of beams changed since frozen_ref
-        self.go_t = time.monotonic()
         self.skip_search = False          # this recovery only backs up: the pose was fine
         self.rev_blind = False            # backing up without a driven track to retrace
         self.wait_since = None            # blocked with no reverse attempts left, since when
@@ -249,6 +259,7 @@ class PurePursuit(Node):
         self.cmd = (0.0, 0.0)             # last speed and steering sent
         self.v_want = 0.0
         self.plan = {}                    # last choose_offset result, for the run log
+        self.skew = 0.0                   # pose skew added to the obstacle threshold [m]
         self.pose_seen = None
         self.err_seen = None
         self.events = []
@@ -264,7 +275,6 @@ class PurePursuit(Node):
         self.idx = None  # re-acquire the nearest waypoint
         self.mode = 'drive'
         self.low_since = None
-        self.go_t = time.monotonic()
         self.frozen_ref = None
         self.contact_scans = 0
         self.track_gen += 1
@@ -298,6 +308,7 @@ class PurePursuit(Node):
             'v_want': _num(self.v_want), 'cmd_v': _num(self.cmd[0]),
             'cmd_steer': _num(self.cmd[1]), 'offset': _num(self.offset),
             'goal': _num(self.plan.get('goal')), 'n_obs': self.plan.get('n_obs', ''),
+            'skew': _num(self.skew),
             'n_free': self.plan.get('n_free', ''), 'n_cand': self.plan.get('n_cand', ''),
             'fit': _num(self.fit), 'corrections': self.corrections,
             'attempts': self.attempts, 'n_contact': len(self.contact_xy),
@@ -330,14 +341,15 @@ class PurePursuit(Node):
         body = ((xy[:, 0] > -self.car_rear - m) & (xy[:, 0] < self.car_front + m)
                 & (np.abs(xy[:, 1]) < self.car_half_width + m))
         self.scan_xy = xy[~body]
-        # hit signal 1: points in a thin band around the body
+        # hit signal: points in a thin band around the front wheels and the bumper. A wall along
+        # the side or behind is not a hit: the car can drive on past it
         m += self.gp('contact_band')
-        near = ((xy[:, 0] > -self.car_rear - m) & (xy[:, 0] < self.car_front + m)
+        near = ((xy[:, 0] > self.gp('contact_front_x')) & (xy[:, 0] < self.car_front + m)
                 & (np.abs(xy[:, 1]) < self.car_half_width + m))
         self.contact_xy = xy[near & ~body]
         enough = len(self.contact_xy) >= self.gp('contact_points')
         self.contact_scans = self.contact_scans + 1 if enough else 0
-        # hit signal 2: the scan stays the same as a reference taken when it last changed
+        # logged only: the scan stays the same as a reference taken when it last changed
         now = time.monotonic()
         if self.frozen_ref is None or len(self.frozen_ref) != len(r):
             self.frozen_ref, self.frozen_since, self.scan_change = r, now, 0.0
@@ -397,7 +409,9 @@ class PurePursuit(Node):
             lat = np.abs(np.hypot(x, y - R) - abs(R))
             # angle swept around the centre; dividing x by R would flip it for right turns
             s = abs(R) * np.arctan2(x, (R - y) * math.copysign(1.0, R))
-        hit = (lat < self.aeb_half_width) & (s > 0.0) & (s < reach)
+        # only what lies ahead of the bumper: a wall already alongside the body is not in the way
+        # (counting it froze the car next to inner walls, 2026-11-08)
+        hit = (lat < self.aeb_half_width) & (s > self.car_front) & (s < reach)
         return float(s[hit].min()) if hit.any() else None
 
     def pursuit_steer(self, x, y, yaw, tx, ty):
@@ -453,7 +467,9 @@ class PurePursuit(Node):
         c, s = math.cos(yaw), math.sin(yaw)
         px = x + c * self.scan_xy[:, 0] - s * self.scan_xy[:, 1]
         py = y + s * self.scan_xy[:, 0] + c * self.scan_xy[:, 1]
-        new = self.matcher.wall_dist(px, py) > self.gp('obstacle_min_map_dist')
+        wd = self.matcher.wall_dist(px, py)
+        self.skew = float(np.clip(np.median(wd) * self.gp('skew_gain'), 0.0, self.gp('skew_max')))
+        new = wd > self.gp('obstacle_min_map_dist') + self.skew
         if not new.any():
             return None
         return np.column_stack([px[new], py[new]])
@@ -595,21 +611,15 @@ class PurePursuit(Node):
             f'{math.degrees(dyaw):+.1f} deg, fit {self.fit * 100:.0f}% -> {fit * 100:.0f}%')
 
     def hit_reason(self, x, y, yaw):
-        """Why the LiDAR says the car hit something while it should drive, or None."""
-        now = time.monotonic()
-        if self.contact_scans >= 2:
-            c, s = math.cos(yaw), math.sin(yaw)
-            px = x + c * self.contact_xy[:, 0] - s * self.contact_xy[:, 1]
-            py = y + s * self.contact_xy[:, 0] + c * self.contact_xy[:, 1]
-            on_wall = self.matcher.wall_dist(px, py) < self.gp('contact_wall_dist')
-            if on_wall.sum() >= self.gp('contact_points'):
-                return f'벽 접촉: 차체 옆 라이다 점 {int(on_wall.sum())}개'
-        if now - self.go_t < self.gp('hit_start_grace'):
+        """Why the LiDAR says the front wheels or the bumper are at a map wall, or None."""
+        if self.contact_scans < 2:
             return None
-        frozen = now - self.frozen_since
-        limit = self.gp('frozen_stop_time') if self.cmd[0] == 0.0 else self.gp('frozen_time')
-        if frozen > limit:
-            return f'{frozen:.1f}초 동안 스캔 변화 없음: {self.status}'
+        c, s = math.cos(yaw), math.sin(yaw)
+        px = x + c * self.contact_xy[:, 0] - s * self.contact_xy[:, 1]
+        py = y + s * self.contact_xy[:, 0] + c * self.contact_xy[:, 1]
+        on_wall = self.matcher.wall_dist(px, py) < self.gp('contact_wall_dist')
+        if on_wall.sum() >= self.gp('contact_points'):
+            return f'벽에 박음: 앞바퀴·범퍼 옆 라이다 점 {int(on_wall.sum())}개'
         return None
 
     def way_free(self, pose):
@@ -636,45 +646,41 @@ class PurePursuit(Node):
             self.wait_since = None
 
     def start_recovery(self, reason, hit=False):
+        """hit: back out of a wall (only called with reverse_enabled). Otherwise the pose is
+        lost: find it again where the car stands, never backing up for that."""
         self.running = False
         self.track_gen += 1
         self.recovered_at = None
         self.stop(f'LOST: {reason}')
+        if not hit:
+            self.mode = 'search'
+            self.event(f'위치 틀어짐 ({reason}) → 제자리에서 위치 재설정')
+            return
         if self.attempts >= self.gp('max_attempts'):
             # backing up has not helped: no more blind reversing, but do not give up either
-            if hit:
-                self.mode = 'wait'
-                self.wait_t0 = time.monotonic()
-                self.wait_since = self.wait_since or self.wait_t0
-                self.event(f'복구 {self.attempts}번 실패 ({reason}) → 후진 없이 길이 열릴 때까지 대기')
-            else:
-                self.mode = 'search'
-                self.event(f'복구 {self.attempts}번 실패 ({reason}) → 후진 없이 위치 찾기 반복')
+            self.mode = 'wait'
+            self.wait_t0 = time.monotonic()
+            self.wait_since = self.wait_since or self.wait_t0
+            self.event(f'후진 {self.attempts}번으로도 못 빠져나옴 ({reason}) → 길이 열릴 때까지 대기')
             return
         self.attempts += 1
         odom = self.lookup('odom')
         self.trouble_at = odom
-        # stopped or hit with the scan still fitting the map: the pose is fine, and searching for
-        # it again only costs time and can move it to a similar spot further along a straight
-        pose_ok = hit and self.fit is not None and self.fit >= self.gp('resume_fit')
+        # with the scan still fitting the map the pose is fine: back up and drive on at once
+        self.skip_search = self.fit is not None and self.fit >= self.gp('resume_fit')
         tries = f'(시도 {self.attempts}/{self.gp("max_attempts")})'
-        # right after a start there is no driven track yet: a hit may still back straight out
-        no_track = len(self.trail) < 3
-        if self.gp('reverse_enabled') and odom and (not no_track or hit):
-            self.mode = 'reverse'
-            self.skip_search = pose_ok
-            self.rev_blind = no_track
-            self.rev_start, self.rev_t0, self.rev_last = None, time.monotonic(), odom
-            then = '바로 재출발' if pose_ok else '위치 재설정'
-            self.event(f'복구 시작 ({reason}) → 지나온 길로 후진 후 {then} {tries}')
-        elif pose_ok:
+        if odom is None:
             self.mode = 'wait'
             self.wait_t0 = time.monotonic()
             self.wait_since = self.wait_since or self.wait_t0
-            self.event(f'복구 시작 ({reason}) → 후진할 수 없어 길이 열릴 때까지 대기 {tries}')
-        else:
-            self.mode = 'search'
-            self.event(f'복구 시작 ({reason}) → 위치 재설정 {tries}')
+            self.event(f'{reason} → 오도메트리가 없어 후진하지 못하고 대기 {tries}')
+            return
+        # right after a start there is no driven track yet: back straight out a short way
+        self.rev_blind = len(self.trail) < 3
+        self.mode = 'reverse'
+        self.rev_start, self.rev_t0, self.rev_last = None, time.monotonic(), odom
+        then = '바로 재출발' if self.skip_search else '위치 재설정 후 출발'
+        self.event(f'{reason} → 지나온 길로 후진, {then} {tries}')
 
     def step_wait(self, pose):
         self.drive(0.0, 0.0)
@@ -841,10 +847,12 @@ class PurePursuit(Node):
             self.update_fit(x, y, yaw)
             if self.low_since and time.monotonic() - self.low_since > self.gp('lost_time'):
                 return self.start_recovery(f'맵과 {self.fit * 100:.0f}%만 맞음')
-            hit = self.hit_reason(x, y, yaw)
+            # hit detection only exists to back out of a hit; with reversing off the car drives
+            # exactly as before it was added (AEB and BLOCKED still stop it)
+            hit = self.hit_reason(x, y, yaw) if self.gp('reverse_enabled') else None
             if hit:
                 return self.start_recovery(hit, hit=True)
-        if self.running and err > 1.0:
+        if self.running and err > self.gp('off_path_limit'):
             if self.recovery_on:
                 return self.start_recovery(f'경로에서 {err:.2f} m 벗어남')
             self.running = False

@@ -7,13 +7,14 @@ Which column answers what:
   goal != 0, offset does not move the shift is not being followed
   fit low                         localization is off (walls can then look like obstacles)
   n_contact, scan_change, frozen_s  the hit signals; check them first after a false recovery
+  skew                            pose offset added to the obstacle threshold (high = pose off)
 """
 import csv
 import os
 import time
 
 FIELDS = ('t', 'x', 'y', 'yaw', 'i', 'off_path', 'mode', 'running', 'status',
-          'v_want', 'cmd_v', 'cmd_steer', 'offset', 'goal', 'n_obs', 'n_free', 'n_cand',
+          'v_want', 'cmd_v', 'cmd_steer', 'offset', 'goal', 'n_obs', 'skew', 'n_free', 'n_cand',
           'fit', 'corrections', 'attempts', 'n_contact', 'scan_change', 'frozen_s', 'event')
 
 
