@@ -6,7 +6,7 @@ joy_node cannot see the pad in that mode. Set the switch on the back of the pad 
 
 /joy layout:
   axes:    0 steering (+left), 1 left stick Y (+up), 2 right stick X (+left),
-           3 right stick Y (+up), 4 RT (0..1), 5 LT (0..1)
+           3 right stick Y (+up), 4 RT (0..1), 5 LT (0..1), 6 throttle RT - LT (-1..1, see shape_throttle)
   buttons: 0 X, 1 A, 2 B, 3 Y, 4 LB, 5 RB, 8 back, 9 start, 10 L3, 11 R3
 """
 import time
@@ -22,7 +22,7 @@ PRODUCT_ID = 0xc21f
 ENDPOINT_IN = 0x81
 PUBLISH_PERIOD = 0.02
 READ_TIMEOUT_MS = 10
-NEUTRAL_AXES = [0.0] * 6
+NEUTRAL_AXES = [0.0] * 7
 NEUTRAL_BUTTONS = [0] * 12
 
 
@@ -37,7 +37,20 @@ def shape_steering(x, deadzone, full):
     return size if x > 0.0 else -size
 
 
-def parse_report(data, deadzone, full):
+def shape_throttle(t, deadzone, minimum):
+    """Map RT - LT to -1..1 with a floor: any press past the deadzone asks for at least minimum.
+
+    Below about 0.5 m/s the sensorless motor cogs: it stalls, the speed loop winds up, and the
+    car then jumps off. A light press now starts at the floor instead.
+    """
+    size = (abs(t) - deadzone) / (1.0 - deadzone)
+    if size <= 0.0:
+        return 0.0
+    size = minimum + (1.0 - minimum) * min(size, 1.0)
+    return size if t > 0.0 else -size
+
+
+def parse_report(data, deadzone, full, throttle_deadzone=0.0, throttle_min=0.0):
     """Return (axes, buttons) from an input report, or None for any other message."""
     if len(data) < 14 or data[0] != 0x00 or data[1] != 0x14:
         return None
@@ -54,6 +67,8 @@ def parse_report(data, deadzone, full):
         data[5] / 255.0,
         data[4] / 255.0,
     ]
+    # joy_teleop maps one axis to the speed: RT drives forward, LT backward, both cancel
+    axes.append(shape_throttle(axes[4] - axes[5], throttle_deadzone, throttle_min))
     buttons = [
         int(bool(high & 0x40)),     # X
         int(bool(high & 0x10)),     # A
@@ -78,6 +93,8 @@ class F710XInput(Node):
         self.declare_parameter('steer_deadzone', 0.08)
         self.declare_parameter('steer_full', 0.92)
         self.declare_parameter('silence_timeout', 1.0)
+        self.declare_parameter('throttle_deadzone', 0.05)
+        self.declare_parameter('throttle_min', 0.4)
         self.pub = self.create_publisher(Joy, 'joy', 10)
         self.device = None
         self.was_connected = False
@@ -117,7 +134,9 @@ class F710XInput(Node):
             data = self.device.read(ENDPOINT_IN, 64, timeout=READ_TIMEOUT_MS)
         except usb.core.USBTimeoutError:
             return
-        report = parse_report(data, deadzone, full)
+        report = parse_report(data, deadzone, full,
+                              self.get_parameter('throttle_deadzone').value,
+                              self.get_parameter('throttle_min').value)
         if report is not None:
             self.axes, self.buttons = report
             self.last_report = time.monotonic()
