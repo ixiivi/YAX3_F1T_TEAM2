@@ -7,16 +7,17 @@ Usage:
 An existing CSV for this map opens ready to edit, with a point about every metre and more
 in tight corners.
 
-Mouse / keys (in the map window):
-  left click, a  add point at the end (a = at the mouse cursor, for remote desktops)
+The icon bar on the left has every action; hover a button for its name and key.
+Mouse on the map:
+  left click     add a point at the end
   drag a point   move it; the path follows while dragging
   drag the path  add a point there and move it
   right click    remove the point under the cursor
-  z              undo
-  c              toggle closed loop (lap) / open path
-  enter          smooth, compute speeds, save CSV + preview PNG
-  r              clear all points (z brings them back)
-  q / esc        quit without saving
+  right drag     move the view
+  wheel          zoom in / out at the cursor
+
+Keys: a add at the cursor (for remote desktops), z undo, c closed loop / open path,
+r clear all (z brings them back), + / - zoom, 0 whole map, enter save, q quit.
 
 CSV format (same as the legacy race_stack): x,y,speed  in the map frame [m, m, m/s].
 """
@@ -26,19 +27,46 @@ import signal
 import sys
 
 import matplotlib
-matplotlib.use('Qt5Agg')
-import matplotlib.pyplot as plt  # noqa: E402
-import numpy as np  # noqa: E402
-import yaml  # noqa: E402
-from PIL import Image  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: F401  (tests close figures through it)
+import numpy as np
+import yaml
+from PIL import Image
 
-from waypoint_nav.path_tools import (distance_to_polyline, handles_from_path,  # noqa: E402
+from waypoint_nav.map_editor import (BUTTON, KOREAN_FONTS, STYLE, ZOOM_STEP, _icon_lines,
+                                     make_icon, zoomed)
+from waypoint_nav.path_tools import (distance_to_polyline, handles_from_path,
                                      read_csv, smooth_path, speed_profile, write_csv)
 
 WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
 GRAB_POINT = 10     # screen pixels: a press this close grabs a point
 GRAB_PATH = 6       # screen pixels: a press this close to the path adds a point there
 DRAG_START = 3      # screen pixels: less movement than this is a click, not a drag
+TEXT = {
+    'ko': {'undo': '되돌리기', 'loop': '닫힌 경로 / 열린 경로',
+           'loop_tip': '닫힌 경로: 마지막 점이 첫 점으로 이어지는 한 바퀴',
+           'clear': '모든 점 지우기', 'clear_tip': '되돌리기로 복구 가능',
+           'zoom_in': '확대', 'zoom_out': '축소', 'fit': '전체 보기',
+           'save': '저장', 'save_tip': '경로를 부드럽게 만들고 속도를 계산해 CSV와 미리보기 PNG로 저장',
+           'quit': '종료', 'quit_tip': '저장 안 한 변경은 사라짐',
+           'help': '클릭: 점 추가   점 드래그: 이동   경로 드래그: 점 끼우기   '
+                   '오른쪽 클릭: 점 삭제   오른쪽 드래그: 이동   휠: 확대/축소',
+           'closed': '닫힌 경로', 'open': '열린 경로', 'pts': '점 {n}개',
+           'unsaved': '저장 안 된 변경 있음', 'need': '점이 {n}개 이상 필요해요',
+           'same_spot': '두 점이 같은 자리에 있어 부드럽게 만들 수 없어요',
+           'saved': '저장됨: 점 {n}개, {m:.1f} m, 속도 {v0:.2f}~{v1:.2f} m/s'},
+    'en': {'undo': 'Undo', 'loop': 'Closed loop / open path',
+           'loop_tip': 'closed: the last point joins the first, one lap',
+           'clear': 'Clear all points', 'clear_tip': 'undo brings them back',
+           'zoom_in': 'Zoom in', 'zoom_out': 'Zoom out', 'fit': 'Whole map',
+           'save': 'Save', 'save_tip': 'smooth the path, compute speeds, write CSV and preview PNG',
+           'quit': 'Quit', 'quit_tip': 'unsaved changes are lost',
+           'help': 'click: add   drag point: move   drag path: insert   right click: remove   '
+                   'right drag: move view   wheel: zoom',
+           'closed': 'closed loop', 'open': 'open path', 'pts': '{n} points',
+           'unsaved': 'unsaved changes', 'need': 'need at least {n} points',
+           'same_spot': 'cannot smooth: two points are on the same spot',
+           'saved': 'saved {n} pts, {m:.1f} m, v {v0:.2f}..{v1:.2f} m/s'},
+}
 
 
 def load_map(yaml_path):
@@ -70,8 +98,33 @@ def insert_index(pts, p, closed):
     return int(detour.argmin()) + 1
 
 
+def _icon_lines_wp(name, p, QtCore, QtGui):
+    """The map editor's icons plus the ones only this editor has, in the same outline style."""
+    P, R = QtCore.QPointF, QtCore.QRectF
+    if name == 'loop':          # a loop with an arrow head
+        p.drawArc(R(4, 4, 16, 16), 100 * 16, 300 * 16)
+        p.drawLine(P(12, 4), P(15.5, 1.5))
+        p.drawLine(P(12, 4), P(15.5, 7))
+    elif name == 'clear':       # bin
+        p.drawLine(P(4, 6), P(20, 6))
+        p.drawLine(P(9.5, 6), P(9.5, 3.5))
+        p.drawLine(P(9.5, 3.5), P(14.5, 3.5))
+        p.drawLine(P(14.5, 3.5), P(14.5, 6))
+        p.drawPolygon(QtGui.QPolygonF([P(6, 6), P(7.5, 21), P(16.5, 21), P(18, 6)]))
+        for x in (10, 14):
+            p.drawLine(P(x, 10), P(x, 17))
+    else:
+        _icon_lines(name, p, QtCore, QtGui)
+
+
 class Editor:
+    """Map view (matplotlib) beside the map editor's icon bar (Qt)."""
+
     def __init__(self, yaml_path, out_name, args):
+        from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+        from PyQt5 import QtCore, QtGui, QtWidgets
+        self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv[:1])
         self.img, self.res, self.origin = load_map(yaml_path)
         self.h = self.img.shape[0]
         self.args = args
@@ -82,43 +135,125 @@ class Editor:
         self.history = []       # point lists to go back to with undo
         self.drag = None        # index of the point held by the mouse
         self.drag_from = None   # screen position of that press, until the drag really starts
+        self.pan = None         # (mouse x, y in pixels, xlim, ylim, moved) while right-dragging
         self.dirty = False
+        families = set(QtGui.QFontDatabase().families())
+        self.t = TEXT['ko' if families & set(KOREAN_FONTS) else 'en']
         out = os.path.join(WP_DIR, self.out_name)
         if os.path.exists(out):
             handles, self.closed = handles_from_path(read_csv(out))
             self.pts = [tuple(p) for p in handles]
             print(f'opened {out}: {len(self.pts)} points', flush=True)
-        # free our keys from matplotlib's defaults (c = back, r = home, a/z/s ...)
-        for name in [k for k in plt.rcParams if k.startswith('keymap.')]:
-            plt.rcParams[name] = [k for k in plt.rcParams[name]
-                                  if k not in ('a', 'c', 'r', 'z', 's', 'enter')]
-        self.fig, self.ax = plt.subplots(figsize=(10, 10))
-        self.ax.imshow(self.img, cmap='gray', origin='upper')
-        self._crop_to_known_area()
+
+        # ---- map ----
+        self.fig = Figure(figsize=(10, 9))
+        FigureCanvasQTAgg(self.fig)
+        self.ax = self.fig.add_axes((0.06, 0.04, 0.92, 0.94))
+        self.ax.imshow(self.img, cmap='gray', origin='upper', vmin=0, vmax=255,
+                       interpolation='nearest')
         self.curve_line, = self.ax.plot([], [], '-', color='tab:orange', lw=1.5)
         self.click_line, = self.ax.plot([], [], 'o', color='tab:blue', ms=7, mec='white', mew=0.8)
         self.path_line = None
-        self.fig.canvas.mpl_connect('button_press_event', self.on_click)
-        self.fig.canvas.mpl_connect('motion_notify_event', self.on_motion)
-        self.fig.canvas.mpl_connect('button_release_event', self.on_release)
-        self.fig.canvas.mpl_connect('key_press_event', self.on_key)
+        for ev, cb in (('button_press_event', self.on_click), ('motion_notify_event', self.on_motion),
+                       ('button_release_event', self.on_release), ('key_press_event', self.on_key),
+                       ('scroll_event', self.on_scroll)):
+            self.fig.canvas.mpl_connect(ev, cb)
+
+        # ---- icon bar, top to bottom (same layout code as the map editor) ----
+        t = self.t
+        bar = QtWidgets.QWidget(objectName='bar')
+        lay = QtWidgets.QVBoxLayout(bar)
+        lay.setContentsMargins(6, 8, 6, 8)
+        lay.setSpacing(4)
+        self.buttons = {}
+
+        def button(key, shortcut, slot, tip=''):
+            b = QtWidgets.QToolButton()
+            b.setIcon(make_icon(key, QtCore, QtGui, draw=_icon_lines_wp))
+            b.setIconSize(QtCore.QSize(BUTTON - 14, BUTTON - 14))
+            b.setFixedSize(BUTTON, BUTTON)
+            b.setToolTip(f'<b>{t[key]}</b> ({shortcut})' + (f'<br>{tip}' if tip else ''))
+            b.clicked.connect(slot)
+            lay.addWidget(b, 0, QtCore.Qt.AlignHCenter)
+            self.buttons[key] = b
+            return b
+
+        def line():
+            f = QtWidgets.QFrame(objectName='line')
+            f.setFrameShape(QtWidgets.QFrame.HLine)
+            lay.addWidget(f)
+
+        button('undo', 'Z', self.act(self.undo))
+        button('loop', 'C', self.act(self.toggle_closed), t['loop_tip'])
+        button('clear', 'R', self.act(self.clear), t['clear_tip'])
+        line()
+        button('zoom_in', '+', lambda: self.zoom(1 / ZOOM_STEP))
+        button('zoom_out', '-', lambda: self.zoom(ZOOM_STEP))
+        button('fit', '0', self.fit_view)
+        line()
+        button('save', 'Enter', self.save, t['save_tip'])
+        lay.addStretch(1)
+        button('quit', 'Q', lambda: self.win.close(), t['quit_tip'])
+
+        self.win = QtWidgets.QMainWindow()
+        self.win.setStyleSheet(STYLE)
+        body = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(body)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(0)
+        row.addWidget(bar)
+        row.addWidget(self.fig.canvas, 1)
+        self.win.setCentralWidget(body)
+        self.win.resize(1100, 850)
+        self.status = QtWidgets.QLabel()
+        self.win.statusBar().addWidget(self.status, 1)
+        self.win.statusBar().addPermanentWidget(QtWidgets.QLabel(t['help']))
+        # 'a' stays a matplotlib key: it needs the cursor position on the map
+        keys = {'Z': self.act(self.undo), 'C': self.act(self.toggle_closed),
+                'R': self.act(self.clear), '+': lambda: self.zoom(1 / ZOOM_STEP),
+                '=': lambda: self.zoom(1 / ZOOM_STEP), '-': lambda: self.zoom(ZOOM_STEP),
+                '0': self.fit_view, 'Return': self.save, 'Enter': self.save,
+                'Q': self.win.close, 'Escape': self.win.close}
+        self.shortcuts = []
+        for seq, slot in keys.items():
+            sc = QtWidgets.QShortcut(QtGui.QKeySequence(seq), self.win)
+            sc.activated.connect(slot)
+            self.shortcuts.append(sc)
+        self.fit_view()
         self.redraw()
 
-    def _crop_to_known_area(self):
+    # ---------- actions shared by buttons, Qt shortcuts and matplotlib keys ----------
+    def act(self, change):
+        def run():
+            change()
+            self.redraw()
+        return run
+
+    def toggle_closed(self):
+        self.remember()
+        self.closed = not self.closed
+
+    def clear(self):
+        self.remember()
+        self.pts = []
+
+    def zoom(self, factor, center=None):
+        xl, yl = self.ax.get_xlim(), self.ax.get_ylim()
+        cx, cy = center or (sum(xl) / 2, sum(yl) / 2)
+        self.ax.set_xlim(zoomed(xl, cx, factor))
+        self.ax.set_ylim(zoomed(yl, cy, factor))
+        self.fig.canvas.draw_idle()
+
+    def fit_view(self):
         known = np.argwhere(self.img != 205)
         if len(known):
             (r0, c0), (r1, c1) = known.min(0), known.max(0)
             pad = 20
             self.ax.set_xlim(c0 - pad, c1 + pad)
             self.ax.set_ylim(r1 + pad, r0 - pad)
+        self.fig.canvas.draw_idle()
 
-    def title(self, msg=''):
-        mode = 'closed loop' if self.closed else 'open path'
-        changed = '  |  * not saved' if self.dirty else ''
-        self.ax.set_title(f'{self.map_name}  |  {len(self.pts)} pts  |  {mode}  (c: toggle){changed}\n'
-                          'click/a: add  drag: move  right: remove  z: undo  '
-                          f'enter: save  r: reset  q: quit   {msg}')
-
+    # ---------- path ----------
     def curve(self):
         """The path as it would be saved, or straight lines while it cannot be smoothed yet."""
         if not self.pts:
@@ -142,7 +277,12 @@ class Editor:
         self.click_line.set_data(px[:, 0], px[:, 1])
         curve = self.to_px(self.curve())
         self.curve_line.set_data(curve[:, 0], curve[:, 1])
-        self.title(msg)
+        t = self.t
+        parts = [f'{self.map_name}{" *" if self.dirty else ""}', t['pts'].format(n=len(self.pts)),
+                 t['closed'] if self.closed else t['open'],
+                 msg or (t['unsaved'] if self.dirty else '')]
+        self.status.setText('   |   '.join(p for p in parts if p))
+        self.win.setWindowTitle(f'waypoint editor — {self.out_name}{" *" if self.dirty else ""}')
         self.fig.canvas.draw_idle()
 
     def remember(self):
@@ -159,6 +299,7 @@ class Editor:
             self.dirty = True
             self.drag = None
 
+    # ---------- mouse ----------
     def event_world(self, ev):
         return px_to_world(ev.xdata, ev.ydata, self.h, self.res, self.origin)
 
@@ -185,28 +326,39 @@ class Editor:
         print(f'point {len(self.pts)}: ({x:.2f}, {y:.2f}) m', flush=True)
 
     def on_click(self, ev):
-        print(f'[mouse] button={ev.button} in_map={ev.inaxes == self.ax} '
-              f'tool={self.fig.canvas.toolbar.mode or "none"}', flush=True)
-        if self.fig.canvas.toolbar.mode or ev.inaxes != self.ax:
-            return  # ignore clicks while zoom/pan tool is active
-        hit = self.point_at(ev)
+        if ev.inaxes != self.ax:
+            return
         if ev.button == 3:
-            if hit is not None:
-                self.remember()
-                del self.pts[hit]
-        elif ev.button == 1:
-            if hit is not None:
-                self.drag, self.drag_from = hit, (ev.x, ev.y)
-            elif self.on_path(ev):
-                # the new point is held right away: it starts on the path and follows the mouse
-                self.remember()
-                self.drag = insert_index(self.pts, self.event_world(ev), self.closed)
-                self.pts.insert(self.drag, self.event_world(ev))
-            else:
-                self.add_point(ev)
+            # removal happens on release, unless the right button dragged the view
+            self.pan = (ev.x, ev.y, self.ax.get_xlim(), self.ax.get_ylim(), False)
+            return
+        if ev.button != 1:
+            return
+        hit = self.point_at(ev)
+        if hit is not None:
+            self.drag, self.drag_from = hit, (ev.x, ev.y)
+        elif self.on_path(ev):
+            # the new point is held right away: it starts on the path and follows the mouse
+            self.remember()
+            self.drag = insert_index(self.pts, self.event_world(ev), self.closed)
+            self.pts.insert(self.drag, self.event_world(ev))
+        else:
+            self.add_point(ev)
         self.redraw()
 
     def on_motion(self, ev):
+        if self.pan is not None:
+            x0, y0, xl, yl, moved = self.pan
+            if not moved and np.hypot(ev.x - x0, ev.y - y0) < DRAG_START:
+                return
+            self.pan = (x0, y0, xl, yl, True)
+            bb = self.ax.bbox
+            dx = (ev.x - x0) * (xl[1] - xl[0]) / bb.width
+            dy = (ev.y - y0) * (yl[1] - yl[0]) / bb.height
+            self.ax.set_xlim(xl[0] - dx, xl[1] - dx)
+            self.ax.set_ylim(yl[0] - dy, yl[1] - dy)
+            self.fig.canvas.draw_idle()
+            return
         if self.drag is None or ev.inaxes != self.ax or ev.xdata is None:
             return
         if self.drag_from is not None:
@@ -218,43 +370,58 @@ class Editor:
         self.redraw()
 
     def on_release(self, ev):
+        if self.pan is not None:
+            moved = self.pan[4]
+            self.pan = None
+            if not moved and ev.inaxes == self.ax:
+                hit = self.point_at(ev)
+                if hit is not None:
+                    self.remember()
+                    del self.pts[hit]
+                    self.redraw()
+            return
         if self.drag is not None and self.drag_from is None:
             x, y = self.pts[self.drag]
             print(f'point {self.drag + 1}: moved to ({x:.2f}, {y:.2f}) m', flush=True)
         self.drag = self.drag_from = None
 
+    def on_scroll(self, ev):
+        if ev.inaxes == self.ax and ev.xdata is not None:
+            self.zoom(1 / ZOOM_STEP if ev.button == 'up' else ZOOM_STEP, (ev.xdata, ev.ydata))
+
     def on_key(self, ev):
+        """Keys that reach matplotlib: 'a' (needs the cursor), and the rest when no Qt shortcut
+        took them first (tests send key events straight to the canvas)."""
         if ev.key == 'a':
             self.add_point(ev)
         elif ev.key == 'z':
             self.undo()
         elif ev.key == 'c':
-            self.remember()
-            self.closed = not self.closed
+            self.toggle_closed()
         elif ev.key == 'r':
-            self.remember()
-            self.pts = []
+            self.clear()
         elif ev.key == 'enter':
             self.save()
             return
         elif ev.key in ('q', 'escape'):
-            plt.close(self.fig)
+            self.win.close()
             return
         self.redraw()
 
     def save(self):
+        t = self.t
         need = 3 if self.closed else 2
         if len(self.pts) < need:
-            self.redraw(f'need at least {need} points')
+            self.redraw(t['need'].format(n=need))
             return
         a = self.args
         try:
             xy, length = smooth_path(self.pts, self.closed)
         except (ValueError, TypeError):
-            self.redraw('cannot smooth: two points are on the same spot')
+            self.redraw(t['same_spot'])
             return
         if not np.isfinite(xy).all():
-            self.redraw('cannot smooth: two points are on the same spot')
+            self.redraw(t['same_spot'])
             return
         v = speed_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon)
         os.makedirs(WP_DIR, exist_ok=True)
@@ -267,8 +434,8 @@ class Editor:
                                          vmin=a.vmin, vmax=a.vmax)
         self.fig.savefig(out.replace('.csv', '.png'), dpi=120, bbox_inches='tight')
         self.dirty = False
-        msg = f'saved {len(xy)} pts, {length:.1f} m, v {v.min():.2f}..{v.max():.2f} m/s'
-        print(f'{msg} -> {out}', flush=True)
+        msg = t['saved'].format(n=len(xy), m=length, v0=v.min(), v1=v.max())
+        print(f'saved {len(xy)} pts, {length:.1f} m -> {out}', flush=True)
         self.redraw(msg)
 
 
@@ -284,13 +451,13 @@ def main():
     p.add_argument('--alon', type=float, default=1.5, help='max accel/brake [m/s^2]')
     args = p.parse_args(sys.argv[1:] if '--ros-args' not in sys.argv
                         else sys.argv[1:sys.argv.index('--ros-args')])
-    # keep a reference: mpl_connect only holds weak refs, so an unreferenced Editor gets
-    # garbage collected and every click/key callback silently disconnects
-    editor = Editor(args.map_yaml, args.out, args)  # noqa: F841
+    editor = Editor(args.map_yaml, args.out, args)
+    editor.win.show()
     # the Qt event loop never returns to Python, so let Ctrl+C kill the process directly
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    plt.show()
+    sys.exit(editor.app.exec_())
 
 
 if __name__ == '__main__':
+    matplotlib.use('Qt5Agg')
     main()

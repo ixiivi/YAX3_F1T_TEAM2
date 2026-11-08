@@ -226,7 +226,8 @@ def _icon_lines(name, p, QtCore, QtGui):
         p.drawLine(P(21, 12), P(17.5, 15.5))
 
 
-def make_icon(name, QtCore, QtGui, size=64):
+def make_icon(name, QtCore, QtGui, size=64, draw=None):
+    """draw(name, painter, QtCore, QtGui) adds icons of another tool in the same style."""
     pix = QtGui.QPixmap(size, size)
     pix.fill(QtCore.Qt.transparent)
     p = QtGui.QPainter(pix)
@@ -237,7 +238,7 @@ def make_icon(name, QtCore, QtGui, size=64):
     pen.setJoinStyle(QtCore.Qt.RoundJoin)
     p.setPen(pen)
     p.setBrush(QtCore.Qt.NoBrush)
-    _icon_lines(name, p, QtCore, QtGui)
+    (draw or _icon_lines)(name, p, QtCore, QtGui)
     p.end()
     return QtGui.QIcon(pix)
 
