@@ -39,8 +39,10 @@ SETUP =f'source /opt/ros/humble/setup.bash && source {WS}/install/setup.bash'
 SLAM_PARAMS = f'{WS}/src/f1tenth_system/f1tenth_stack/config/f1tenth_online_async.yaml'
 LOG_LINES = 9
 FONT_SCALE = 0.63    # the desktop text scale is 2x, which is too large for a third of a screen
+DRIVE_ROW_H = 48     # [px] height of the keyboard / gamepad / E-STOP row
+DRIVE_ICON_W = 56    # [px] width of the keyboard and gamepad buttons
 STATUS_CARD = 'padding:2px 6px; border-radius:4px; color:white;'
-ERPM_GAIN = 4614.0   # speed_to_erpm_gain in vesc.yaml
+ERPM_GAIN = 4353.0   # speed_to_erpm_gain in vesc.yaml
 REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
 # resting LiPo voltage per cell -> state of charge [%]
 LIPO_SOC = [(3.27, 0), (3.61, 5), (3.69, 10), (3.71, 15), (3.73, 20), (3.75, 25), (3.77, 30),
@@ -266,6 +268,28 @@ class RosLink:
         self.pp_cmd_pub.publish(String(data=cmd))
 
 
+def emoji_pixmap(emoji, size=128):
+    """The emoji drawn large and cropped to its visible pixels, for a centred button icon."""
+    pm = QtGui.QPixmap(size * 2, size * 2)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    f = QtGui.QFont('Noto Color Emoji')
+    f.setPixelSize(size)
+    p.setFont(f)
+    p.drawText(pm.rect(), QtCore.Qt.AlignCenter, emoji)
+    p.end()
+    img = pm.toImage()
+    xs, ys = [], []
+    for y in range(0, img.height(), 2):
+        for x in range(0, img.width(), 2):
+            if img.pixelColor(x, y).alpha() > 20:
+                xs.append(x)
+                ys.append(y)
+    if not xs:
+        return pm
+    return pm.copy(QtCore.QRect(QtCore.QPoint(min(xs), min(ys)), QtCore.QPoint(max(xs) + 1, max(ys) + 1)))
+
+
 def fixed_font():
     f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
     f.setPointSizeF(f.pointSizeF() * FONT_SCALE)
@@ -290,6 +314,7 @@ class Panel(QtWidgets.QWidget):
         self.estop = False
         self.target = self.speed = self.steer = 0.0
         self.last_t = self.stopped_at = time.monotonic()
+        self.joy_live = False      # gamepad on and /joy arriving
         self.brake_until = 0.0     # keep braking this long after the gamepad is turned off
         self.rest_v = None         # smoothed pack voltage at low current, for the charge estimate
 
@@ -322,7 +347,6 @@ class Panel(QtWidgets.QWidget):
         top.addLayout(left)
         top.addWidget(self._auto_box())
         rows.addLayout(top)
-        rows.addWidget(self._manual_box())
         for box in controls.findChildren(QtWidgets.QGroupBox):
             box.layout().setContentsMargins(6, 5, 6, 5)
             box.layout().setSpacing(3)
@@ -331,7 +355,7 @@ class Panel(QtWidgets.QWidget):
         self.scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
         self.scroll.setWidget(controls)
         lay.addWidget(self.scroll)
-        lay.addWidget(self._estop_button())
+        lay.addLayout(self._drive_row())
         lay.addWidget(self.tabs, 1)
 
         QtWidgets.QApplication.instance().installEventFilter(self)
@@ -350,11 +374,16 @@ class Panel(QtWidgets.QWidget):
         row.setVerticalSpacing(1)
         self.st = {}
         for c, (k, name) in enumerate((('battery', '배터리'), ('vesc', 'VESC'), ('lidar', '라이다'),
-                                       ('pose', '위치'), ('speed', '속도'))):
+                                       ('pose', '위치'), ('speed', '속도 (m/s)'))):
             if k != 'battery':   # its name shares a row with the cell count below
                 row.addWidget(QtWidgets.QLabel(name), 0, c)
             lb = QtWidgets.QLabel('-', alignment=QtCore.Qt.AlignCenter)
             lb.setStyleSheet(f'{STATUS_CARD} background:#444')
+            # always two lines tall, so the row does not jump when values with two lines appear
+            lb.setText('0°\n약 0%')   # Hangul and symbols: their fallback fonts have taller lines
+            lb.ensurePolished()
+            lb.setMinimumHeight(lb.sizeHint().height())
+            lb.setText('-')
             row.addWidget(lb, 1, c)
             row.setColumnStretch(c, 1)
             self.st[k] = lb
@@ -371,6 +400,9 @@ class Panel(QtWidgets.QWidget):
             lambda: self.settings.setValue('cells', self.cells_cb.currentData()))
         title = QtWidgets.QHBoxLayout()
         title.addWidget(QtWidgets.QLabel('배터리'))
+        # never narrower than its text: squeezed by the column, '3S' was cut off
+        self.cells_cb.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToContents)
+        self.cells_cb.setMinimumWidth(self.cells_cb.sizeHint().width())
         title.addWidget(self.cells_cb)
         row.addLayout(title, 0, 0)
         return row
@@ -448,55 +480,53 @@ class Panel(QtWidgets.QWidget):
         g.addWidget(self.go_btn, 3, 0, 1, 2)
         g.addWidget(self.stop_btn, 3, 2, 1, 2)
         self.avoid_cb = nofocus(QtWidgets.QCheckBox('장애물 우회', checked=True))
-        self.reverse_cb = nofocus(QtWidgets.QCheckBox('위치 틀어지면 후진', checked=True))
-        self.reverse_cb.setToolTip('위치가 틀어지면 지나온 길로 후진해요')
+        self.reverse_cb = nofocus(QtWidgets.QCheckBox('벽에 박으면 후진', checked=True))
+        self.reverse_cb.setToolTip('앞바퀴나 범퍼가 벽에 닿으면 지나온 길로 후진해요.\n'
+                                    '끄면 충돌 감지도 꺼져요. 위치가 틀어지면 후진 없이 제자리에서 다시 잡아요.')
         g.addWidget(self.avoid_cb, 4, 0, 1, 4)
         g.addWidget(self.reverse_cb, 5, 0, 1, 4)
-        # status text can be long: wrap it rather than let it widen the window
-        self.pp_label = QtWidgets.QLabel('-')
-        self.pp_label.setWordWrap(True)
-        g.addWidget(self.pp_label, 6, 0, 1, 4)
+        # the node's own status lines are in the 자율주행 log tab; here only the last event
         self.event_label = QtWidgets.QLabel('')
         self.event_label.setWordWrap(True)
         self.event_label.setStyleSheet('color:#e65100; font-weight:bold')
-        g.addWidget(self.event_label, 7, 0, 1, 4)
-        g.setRowStretch(8, 1)
+        g.addWidget(self.event_label, 6, 0, 1, 4)
+        g.setRowStretch(7, 1)
         return box
 
-    def _manual_box(self):
-        box = QtWidgets.QGroupBox('수동 주행')
-        row = QtWidgets.QHBoxLayout(box)
-        v = QtWidgets.QVBoxLayout()
-        self.manual_btn = self._button('키보드 켜기', self.toggle_manual)
-        self.manual_btn.setToolTip('W/S 속도 ±   A/D 조향   X 조향 중앙\n'
-                                   'Space 감속 정지   B 즉시 정지\n'
-                                   '키 한 번 = 한 단계, 꾹 눌러도 한 번')
-        v.addWidget(self.manual_btn)
-        self.manual_label = QtWidgets.QLabel('꺼짐')
-        self.manual_label.setFont(fixed_font())
-        self.manual_label.setWordWrap(True)
-        v.addWidget(self.manual_label)
-        v.addStretch(1)
-        row.addLayout(v, 1)
-        v = QtWidgets.QVBoxLayout()
-        self.joy_btn = self._button('조이스틱 켜기', self.toggle_joy)
-        self.joy_btn.setToolTip('RB 누른 채 RT 가속, 왼쪽 스틱 조향\n'
-                                'LB 자율주행 허용   둘 다 놓으면 정지')
-        v.addWidget(self.joy_btn)
-        self.joy_label = QtWidgets.QLabel('꺼짐')
-        self.joy_label.setWordWrap(True)
-        v.addWidget(self.joy_label)
-        v.addStretch(1)
-        row.addLayout(v, 1)
-        return box
+    def _drive_row(self):
+        """Keyboard and gamepad as small square buttons (blue while on), E-STOP beside them.
 
-    def _estop_button(self):
+        Outside the scroll area, so all three are always on screen."""
+        row = QtWidgets.QHBoxLayout()
         self.estop_btn = self._button('긴급 정지', self.toggle_estop, '#c62828')
-        self.estop_btn.setMinimumHeight(44)
+        self.estop_btn.setMinimumHeight(DRIVE_ROW_H)
         f = self.estop_btn.font()
         f.setPointSize(f.pointSize() + 3)
         self.estop_btn.setFont(f)
-        return self.estop_btn
+        self.manual_btn = self._icon_button('\u2328\ufe0f', self.toggle_manual,
+                                            '키보드 조종 (켜면 자율주행보다 우선)\n'
+                                            'W/S 속도 ±   A/D 조향   X 조향 중앙\n'
+                                            'Space 감속 정지   B 즉시 정지\n'
+                                            '키 한 번 = 한 단계, 꾹 눌러도 한 번')
+        self.joy_btn = self._icon_button('\U0001f579\ufe0f', self.toggle_joy,
+                                         '조이스틱 조종\n'
+                                         'RB 누른 채 RT 가속, LT 후진, 왼쪽 스틱 조향\n'
+                                         'LB 자율주행 허용   둘 다 놓으면 정지\n'
+                                         '주황색: 켜져 있지만 패드 입력이 없어요 (연결·전원 확인)')
+        row.addWidget(self.manual_btn)
+        row.addWidget(self.joy_btn)
+        row.addWidget(self.estop_btn, 1)
+        return row
+
+    def _icon_button(self, emoji, slot, tip):
+        b = self._button('', slot)
+        b.setFixedSize(DRIVE_ICON_W, DRIVE_ROW_H)
+        # as text the emoji sits off centre (its glyph has uneven side bearings); as an icon cut to
+        # the drawn pixels Qt centres it exactly
+        b.setIcon(QtGui.QIcon(emoji_pixmap(emoji)))
+        b.setIconSize(QtCore.QSize(DRIVE_ROW_H * 6 // 10, DRIVE_ROW_H * 6 // 10))
+        b.setToolTip(tip)
+        return b
 
     def place_rviz(self, tries=20):
         """Move RViz beside this window. It ignores -geometry, so find its window once it opens."""
@@ -531,7 +561,10 @@ class Panel(QtWidgets.QWidget):
         m = lay.contentsMargins()
         fixed = (m.top() + m.bottom() + 3 * lay.spacing() + self.status.sizeHint().height()
                  + self.estop_btn.minimumSizeHint().height() + self.tabs.minimumSizeHint().height())
-        need = self.scroll.widget().layout().totalHeightForWidth(self.width() - m.left() - m.right())
+        controls = self.scroll.widget().layout()
+        need = controls.totalHeightForWidth(self.width() - m.left() - m.right())
+        if need < 0:   # before the first layout pass
+            need = controls.sizeHint().height()
         self.scroll.setMinimumHeight(min(need, max(self.height() - fixed,
                                                    4 * self.fontMetrics().height())))
 
@@ -762,8 +795,6 @@ class Panel(QtWidgets.QWidget):
                 self.speed = kt.ramp(self.speed, self.target, dt)
             cmd = kt.floor_speed(self.speed, self.steer)
             self.ros.teleop(cmd, self.steer)
-            self.manual_label.setText(
-                f'속도 {cmd:+.2f} / 목표 {self.target:+.2f} m/s\n조향 {self.steer:+.2f} rad')
 
     def refresh_status(self):
         r, now = self.ros, time.monotonic()
@@ -789,7 +820,7 @@ class Panel(QtWidgets.QWidget):
             put('battery', f'{v:.1f} V\n약 {soc}%',
                 True if v >= 3.7 * cells else (None if v >= 3.5 * cells else False))
             put('vesc', f'fault {r.core.fault_code}', r.core.fault_code == 0)
-            put('speed', f'{r.core.speed / ERPM_GAIN:+.2f}\nm/s', True)
+            put('speed', f'{r.core.speed / ERPM_GAIN:+.2f}', True)
         else:
             self.rest_v = None   # VESC off: the pack may be swapped before it returns
             put('battery', '-', False)
@@ -802,21 +833,10 @@ class Panel(QtWidgets.QWidget):
             put('pose', f'({pose[0]:.1f}, {pose[1]:.1f})\n{math.degrees(pose[2]):.0f}°', True)
         else:
             put('pose', '없음', None)
-        joy_on = self.procs['joy'].running()
-        joy_live = joy_on and now - r.joy_t < 1.0
-        self.joy_label.setText(('입력 수신 중' if joy_live else '⚠ 패드 입력 없음 (연결·전원 확인)')
-                               if joy_on else '꺼짐')
-        if self.procs['pp'].running():
-            text = r.pp_status if now - r.pp_status_t < 1.0 else '자율주행 노드 시작 중...'
-            if self.estop:
-                text = '⚠ 긴급 정지 중  |  ' + text
-            elif self.manual:
-                text = '⚠ 키보드 조종이 켜져 있어 자율주행이 막혀 있어요  |  ' + text
-            elif joy_live:
-                text = '⚠ 조이스틱이 켜져 있어 LB를 누르는 동안만 자율주행이 움직여요  |  ' + text
-            self.pp_label.setText(text)
-        else:
-            self.pp_label.setText('-')
+        live = self.procs['joy'].running() and now - r.joy_t < 1.0
+        if live != self.joy_live:
+            self.joy_live = live
+            self.refresh()
 
     def refresh(self):
         for key, b in self.run_btn.items():
@@ -827,13 +847,11 @@ class Panel(QtWidgets.QWidget):
         self.pp_btn.setText('자율주행 끄기' if pp_on else '자율주행 준비')
         self.go_btn.setEnabled(pp_on and not self.estop)
         self.stop_btn.setEnabled(pp_on)
-        self.manual_btn.setText('키보드 끄기' if self.manual else '키보드 켜기')
-        self.manual_btn.setStyleSheet('background:#1565c0; color:white' if self.manual else '')
-        if not self.manual:
-            self.manual_label.setText('꺼짐 (켜면 자율주행보다 우선)')
+        self.manual_btn.setStyleSheet('background:#1565c0' if self.manual else '')
+        # blue while on; amber while on but the pad sends nothing
         joy_on = self.procs['joy'].running()
-        self.joy_btn.setText('조이스틱 끄기' if joy_on else '조이스틱 켜기')
-        self.joy_btn.setStyleSheet('background:#1565c0; color:white' if joy_on else '')
+        self.joy_btn.setStyleSheet(('background:#1565c0' if self.joy_live else 'background:#f9a825')
+                                   if joy_on else '')
         self.estop_btn.setText('긴급 정지 해제' if self.estop else '긴급 정지')
         self.estop_btn.setStyleSheet(
             ('background:#555;' if self.estop else 'background:#c62828;')
