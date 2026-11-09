@@ -14,7 +14,7 @@ import os
 import time
 
 FIELDS = ('t', 'x', 'y', 'yaw', 'i', 'off_path', 'mode', 'running', 'status',
-          'v_want', 'cmd_v', 'cmd_steer', 'offset', 'goal', 'n_obs', 'skew', 'n_free', 'n_cand',
+          'v_want', 'cmd_v', 'cmd_steer', 'offset', 'goal', 'n_obs', 'n_clusters', 'skew', 'n_free', 'n_cand',
           'fit', 'corrections', 'attempts', 'n_contact', 'n_contact_front', 'scan_change',
           'frozen_s', 'event')
 

@@ -112,6 +112,17 @@ class PurePursuit(Node):
         p('avoid_speed', 1.0)        # [m/s] speed cap while shifted
         # scan points further than this from any map wall are obstacles; generous, because a few
         # cm of AMCL error already moves wall points off the mapped walls
+        # what counts as an obstacle. 'track': clusters of scan points that the map does not explain,
+        # lie inside the track measured across the route (ForzaETH race_stack style) and are small
+        # enough to be an object. With the pose a little off, walls fall outside the track or are
+        # too long; mapped furniture inside a room-sized "track" stays explained by the map.
+        # 'map': only the first test, points far from the mapped walls (the earlier rule).
+        p('obstacle_filter', 'track')
+        p('track_inflation', 0.10)   # [m] keep this far inside the track walls
+        p('track_width_max', 2.0)    # [m] cap on the measured half width of the track
+        p('obs_cluster_gap', 0.15)   # [m] neighbouring scan points further apart split a cluster
+        p('obs_min_points', 6)       # fewer points is noise (ForzaETH uses 10; 6 keeps far cones)
+        p('obs_max_size', 0.5)       # [m] longer clusters are walls, not objects
         p('obstacle_min_map_dist', 0.25)
         # pose skew self-correction (legacy race_stack): when the pose is off, every wall return
         # lands off the mapped walls and turns into an obstacle. The median distance of the scan
@@ -206,6 +217,11 @@ class PurePursuit(Node):
         self.matcher = None
         if gp('map_yaml'):
             self.matcher = MapMatcher(gp('map_yaml'), self.laser_x)
+            self.d_left, self.d_right = self.track_widths()
+            self.route_tree = cKDTree(self.xy)
+            self.get_logger().info(
+                f'track half widths along the route: left {self.d_left.min():.2f}..'
+                f'{self.d_left.max():.2f} m, right {self.d_right.min():.2f}..{self.d_right.max():.2f} m')
             inside = float(self.matcher.inside(self.xy[:, 0], self.xy[:, 1]).mean())
             if inside < 0.9:
                 raise SystemExit(f'웨이포인트의 {(1 - inside) * 100:.0f}%가 맵 밖에 있어요. '
@@ -268,6 +284,7 @@ class PurePursuit(Node):
         self.v_want = 0.0
         self.plan = {}                    # last choose_offset result, for the run log
         self.skew = 0.0                   # pose skew added to the obstacle threshold [m]
+        self.n_clusters = 0               # objects found by the track obstacle filter
         self.pose_seen = None
         self.err_seen = None
         self.events = []
@@ -318,7 +335,7 @@ class PurePursuit(Node):
             'v_want': _num(self.v_want), 'cmd_v': _num(self.cmd[0]),
             'cmd_steer': _num(self.cmd[1]), 'offset': _num(self.offset),
             'goal': _num(self.plan.get('goal')), 'n_obs': self.plan.get('n_obs', ''),
-            'skew': _num(self.skew),
+            'skew': _num(self.skew), 'n_clusters': self.plan.get('n_clusters', ''),
             'n_free': self.plan.get('n_free', ''), 'n_cand': self.plan.get('n_cand', ''),
             'fit': _num(self.fit), 'corrections': self.corrections,
             'attempts': self.attempts, 'n_contact': len(self.contact_xy),
@@ -474,13 +491,55 @@ class PurePursuit(Node):
             off[k] = cur
         return self.xy[idx] + self.normal[idx] * off[:, None]
 
+    def track_widths(self):
+        """Free distance from every route point to the first wall or unknown cell, to the left
+        and to the right along its normal [m]."""
+        m = self.matcher
+        steps = np.arange(0.0, self.gp('track_width_max') + 1e-9, m.res / 2)
+        out = []
+        for sign in (1.0, -1.0):
+            pts = self.xy[:, None, :] + sign * self.normal[:, None, :] * steps[None, :, None]
+            u, v, ins = m._cells(pts[..., 0], pts[..., 1])
+            blocked = ~ins
+            blocked[ins] = m.img[v[ins], u[ins]] < 250       # wall (0) or unknown (205)
+            first = np.where(blocked.any(1), blocked.argmax(1), len(steps) - 1)
+            out.append(steps[first])
+        return out[0], out[1]
+
+    def obstacles_track(self, px, py):
+        """Scan points (map frame, scan order) that form an object inside the track."""
+        pts = np.column_stack([px, py])
+        _, i = self.route_tree.query(pts)
+        d = ((pts - self.xy[i]) * self.normal[i]).sum(1)          # left of the route is +
+        infl = self.gp('track_inflation')
+        inside = (d < self.d_left[i] - infl) & (d > -self.d_right[i] + infl)
+        wd = self.matcher.wall_dist(px, py)
+        self.skew = float(np.clip(np.median(wd) * self.gp('skew_gain'), 0.0, self.gp('skew_max')))
+        inside &= wd > self.gp('obstacle_min_map_dist') + self.skew
+        q = pts[inside]
+        self.n_clusters = 0
+        if len(q) == 0:
+            return None
+        cut = np.flatnonzero(np.hypot(*np.diff(q, axis=0).T) > self.gp('obs_cluster_gap')) + 1
+        keep = []
+        for c in np.split(q, cut):
+            if len(c) < self.gp('obs_min_points'):
+                continue
+            if np.hypot(*(c.max(0) - c.min(0))) > self.gp('obs_max_size'):
+                continue
+            keep.append(c)
+        self.n_clusters = len(keep)
+        return np.vstack(keep) if keep else None
+
     def obstacles_map(self, x, y, yaw):
-        """Scan points (map frame) that the map does not explain: new obstacles."""
+        """Scan points (map frame) that are obstacles, by obstacle_filter."""
         if len(self.scan_xy) == 0:
             return None
         c, s = math.cos(yaw), math.sin(yaw)
         px = x + c * self.scan_xy[:, 0] - s * self.scan_xy[:, 1]
         py = y + s * self.scan_xy[:, 0] + c * self.scan_xy[:, 1]
+        if self.gp('obstacle_filter') == 'track':
+            return self.obstacles_track(px, py)
         wd = self.matcher.wall_dist(px, py)
         self.skew = float(np.clip(np.median(wd) * self.gp('skew_gain'), 0.0, self.gp('skew_max')))
         new = wd > self.gp('obstacle_min_map_dist') + self.skew
@@ -521,6 +580,7 @@ class PurePursuit(Node):
             if cost < best_cost:
                 best, best_cost, best_line = float(goal), cost, pts
         self.plan = {'goal': best, 'n_obs': 0 if obs is None else len(obs),
+                     'n_clusters': self.n_clusters,
                      'n_free': n_free, 'n_cand': len(goals)}
         # what the shift should be right here: the goal while the obstacle is still ahead
         here = best if best is not None and release > 0.0 else 0.0
