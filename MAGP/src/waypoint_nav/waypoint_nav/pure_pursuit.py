@@ -15,8 +15,8 @@ With map_yaml set:
   * relocalization: when the scan stops fitting the map (localization lost) or the pose is far
     off the path, the car stops, finds its pose by scan matching, hands it to AMCL and drives
     on. It never backs up for this.
-  * hit recovery (reverse_enabled): when the LiDAR sees a map wall right at the front wheels or
-    the bumper, the car brakes, backs up along the track it just drove (that space was free a
+  * hit recovery (reverse_enabled): when the LiDAR sees a map wall right in front of the bumper,
+    or at the front wheels while the car cannot get on (a wall alongside alone is no hit), it brakes, backs up along the track it just drove (that space was free a
     moment ago; the rear is a LiDAR blind spot) while turning parallel to the nearby wall, and
     drives on. Each attempt without progress backs up further; after max_attempts it waits
     until the way is free. With reverse_enabled off there is no hit detection at all.
@@ -155,6 +155,11 @@ class PurePursuit(Node):
                                      # minus a wheel radius) and the bumper
         p('contact_points', 3)       # ... at least this many, on two scans in a row ...
         p('contact_wall_dist', 0.25) # ... and this close to a map wall (a car is not a wall)
+        # In front of the bumper that is a hit at once. Beside the front wheels it only is when the
+        # car cannot get on: driving close along a wall put points there too and backed the car
+        # up for nothing (2026-11-08). Stuck = forward command, odom moved less than this:
+        p('stall_time', 0.3)         # [s]
+        p('stall_dist', 0.02)        # [m]
         # logged only (scan_change, frozen_s): shows a car stuck without a visible contact
         p('frozen_change', 0.08)     # [m] a beam changed if its range moved more than this
         p('frozen_fraction', 0.04)   # below this fraction of changed beams the scan is frozen
@@ -246,6 +251,9 @@ class PurePursuit(Node):
         self.corrections = 0
         self.contact_xy = np.empty((0, 2))  # scan points right at the body, base_link frame
         self.contact_scans = 0            # scans in a row with contact
+        self.contact_front = np.empty((0, 2))  # the part of it in front of the bumper
+        self.front_scans = 0
+        self.stall_ref = None             # (odom x, y, time) while checking for a stuck car
         self.frozen_ref, self.frozen_since = None, time.monotonic()
         self.scan_change = 0.0            # fraction of beams changed since frozen_ref
         self.skip_search = False          # this recovery only backs up: the pose was fine
@@ -277,6 +285,8 @@ class PurePursuit(Node):
         self.low_since = None
         self.frozen_ref = None
         self.contact_scans = 0
+        self.front_scans = 0
+        self.stall_ref = None
         self.track_gen += 1
 
     def on_command(self, msg):
@@ -312,6 +322,7 @@ class PurePursuit(Node):
             'n_free': self.plan.get('n_free', ''), 'n_cand': self.plan.get('n_cand', ''),
             'fit': _num(self.fit), 'corrections': self.corrections,
             'attempts': self.attempts, 'n_contact': len(self.contact_xy),
+            'n_contact_front': len(self.contact_front),
             'scan_change': _num(self.scan_change),
             'frozen_s': _num(time.monotonic() - self.frozen_since),
             'event': ' / '.join(self.events)})
@@ -347,8 +358,11 @@ class PurePursuit(Node):
         near = ((xy[:, 0] > self.gp('contact_front_x')) & (xy[:, 0] < self.car_front + m)
                 & (np.abs(xy[:, 1]) < self.car_half_width + m))
         self.contact_xy = xy[near & ~body]
+        self.contact_front = self.contact_xy[self.contact_xy[:, 0] > self.car_front]
         enough = len(self.contact_xy) >= self.gp('contact_points')
         self.contact_scans = self.contact_scans + 1 if enough else 0
+        enough = len(self.contact_front) >= self.gp('contact_points')
+        self.front_scans = self.front_scans + 1 if enough else 0
         # logged only: the scan stays the same as a reference taken when it last changed
         now = time.monotonic()
         if self.frozen_ref is None or len(self.frozen_ref) != len(r):
@@ -610,16 +624,41 @@ class PurePursuit(Node):
             f'drift fix #{self.corrections}: {math.hypot(bx - sx, by - sy) * 100:.0f} cm '
             f'{math.degrees(dyaw):+.1f} deg, fit {self.fit * 100:.0f}% -> {fit * 100:.0f}%')
 
-    def hit_reason(self, x, y, yaw):
-        """Why the LiDAR says the front wheels or the bumper are at a map wall, or None."""
-        if self.contact_scans < 2:
-            return None
+    def on_wall(self, pts, x, y, yaw):
+        """How many of these base_link points lie at a map wall."""
+        if len(pts) == 0:
+            return 0
         c, s = math.cos(yaw), math.sin(yaw)
-        px = x + c * self.contact_xy[:, 0] - s * self.contact_xy[:, 1]
-        py = y + s * self.contact_xy[:, 0] + c * self.contact_xy[:, 1]
-        on_wall = self.matcher.wall_dist(px, py) < self.gp('contact_wall_dist')
-        if on_wall.sum() >= self.gp('contact_points'):
-            return f'벽에 박음: 앞바퀴·범퍼 옆 라이다 점 {int(on_wall.sum())}개'
+        px = x + c * pts[:, 0] - s * pts[:, 1]
+        py = y + s * pts[:, 0] + c * pts[:, 1]
+        return int((self.matcher.wall_dist(px, py) < self.gp('contact_wall_dist')).sum())
+
+    def stalled(self):
+        """True when the car has been told to go forward but odom has not moved for stall_time."""
+        odom = self.lookup('odom')
+        now = time.monotonic()
+        if odom is None or self.speed_cmd <= 0.0:
+            self.stall_ref = None
+            return False
+        if self.stall_ref is None or math.hypot(odom[0] - self.stall_ref[0],
+                                                odom[1] - self.stall_ref[1]) > self.gp('stall_dist'):
+            self.stall_ref = (odom[0], odom[1], now)
+            return False
+        return now - self.stall_ref[2] > self.gp('stall_time')
+
+    def hit_reason(self, x, y, yaw):
+        """Why the LiDAR says the car hit a map wall, or None: a wall right in front of the
+        bumper, or the front wheels at a wall while the car cannot get on."""
+        stalled = self.stalled()
+        need = self.gp('contact_points')
+        if self.front_scans >= 2:
+            n = self.on_wall(self.contact_front, x, y, yaw)
+            if n >= need:
+                return f'범퍼가 벽에 닿음: 라이다 점 {n}개'
+        if self.contact_scans >= 2 and stalled:
+            n = self.on_wall(self.contact_xy, x, y, yaw)
+            if n >= need:
+                return f'앞바퀴가 벽에 걸려 못 나감: 라이다 점 {n}개'
         return None
 
     def way_free(self, pose):
