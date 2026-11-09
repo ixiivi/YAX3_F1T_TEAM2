@@ -3,7 +3,9 @@ joy:
     # f710_xinput: stick X inside the deadzone is straight, at steer_full it is full lock
     steer_deadzone: 0.08
     steer_full: 0.92
-    silence_timeout: 1.0
+    # 0 = off: the pad is silent while held still, and the receiver itself reports
+    # everything released when the pad loses power (see f710_xinput.step)
+    silence_timeout: 0.0
     # trigger travel ignored, then the slowest speed asked for, as a share of the full speed
     # (x drive-speed scale below: 0.4 x 1.25 = 0.5 m/s, the cogging limit of the motor)
     throttle_deadzone: 0.05
