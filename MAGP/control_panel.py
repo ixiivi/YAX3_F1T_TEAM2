@@ -808,19 +808,20 @@ class Panel(QtWidgets.QWidget):
             color = {True: '#2e7d32', False: '#c62828', None: '#f9a825'}[ok]
             self.st[k].setText(text)
             self.st[k].setStyleSheet(f'{STATUS_CARD} background:{color}')
-        fresh = r.core is not None and now - r.core_t < 1.0
+        core = r.core
+        fresh = core is not None and now - r.core_t < 1.0
         if fresh:
-            v = r.core.voltage_input
+            v = core.voltage_input
             if self.rest_v is None:
                 self.rest_v = v
-            elif max(abs(r.core.current_input), abs(r.core.current_motor)) < REST_CURRENT:
+            elif max(abs(core.current_input), abs(core.current_motor)) < REST_CURRENT:
                 self.rest_v += 0.03 * (v - self.rest_v)   # ~10 s time constant at this 0.3 s timer
             cells = self.cells_cb.currentData()
             soc = 5 * round(battery_percent(self.rest_v, cells) / 5)   # VESC reads in 0.1 V: about 5 % steps
             put('battery', f'{v:.1f} V\n약 {soc}%',
                 True if v >= 3.7 * cells else (None if v >= 3.5 * cells else False))
-            put('vesc', f'fault {r.core.fault_code}', r.core.fault_code == 0)
-            put('speed', f'{r.core.speed / ERPM_GAIN:+.2f}', True)
+            put('vesc', f'fault {core.fault_code}', core.fault_code == 0)
+            put('speed', f'{core.speed / ERPM_GAIN:+.2f}', True)
         else:
             self.rest_v = None   # VESC off: the pack may be swapped before it returns
             put('battery', '-', False)
