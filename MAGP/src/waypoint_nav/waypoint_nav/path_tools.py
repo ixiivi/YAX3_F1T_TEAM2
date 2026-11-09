@@ -25,12 +25,15 @@ def smooth_path(pts, closed):
     return xy, s[-1]
 
 
-def handles_from_path(xy):
-    """Editable points for a saved path, which stores only the smoothed result: (points, closed)."""
+def handles_from_path(xy, closed=None):
+    """Editable points for a saved path, which stores only the smoothed result: (points, closed).
+
+    closed=None tells it from the ends of xy (as read from a CSV)."""
     if len(xy) < 2:
-        return xy, True
-    # a closed path has no repeated end point, so its ends are one spacing apart
-    closed = bool(np.linalg.norm(xy[0] - xy[-1]) < 3 * SPACING)
+        return xy, True if closed is None else closed
+    if closed is None:
+        # a closed path has no repeated end point, so its ends are one spacing apart
+        closed = bool(np.linalg.norm(xy[0] - xy[-1]) < 3 * SPACING)
     n = max(3 if closed else 2, round(len(xy) / HANDLE_EVERY))
     if closed:
         idx = np.linspace(0, len(xy), n, endpoint=False).astype(int)
@@ -48,6 +51,19 @@ def handles_from_path(xy):
             break
         idx.add(int(np.argmax(gaps)))
     return xy[sorted(idx)], closed
+
+
+def smoothing_fit(xy, closed, deviation):
+    """A smoothing spline through a path, allowed about `deviation` [m] off it, resampled every
+    SPACING. Unlike moving points one by one this has no kinks: the whole curve eases at once."""
+    pts = np.vstack([xy, xy[:1]]) if closed else np.asarray(xy, dtype=float)
+    tck, _ = splprep(pts.T, s=len(pts) * deviation ** 2, k=3, per=closed)
+    dense = np.array(splev(np.linspace(0, 1, len(pts) * 3), tck)).T
+    seg = np.linalg.norm(np.diff(dense, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    n = max(2, int(s[-1] / SPACING))
+    s_new = np.linspace(0, s[-1], n, endpoint=not closed)
+    return np.column_stack([np.interp(s_new, s, dense[:, 0]), np.interp(s_new, s, dense[:, 1])])
 
 
 def distance_to_polyline(p, line):
@@ -73,8 +89,13 @@ def curvature(xy, closed):
     return k
 
 
-def speed_profile(xy, closed, vmax, vmin, a_lat, a_lon):
-    """Curvature-limited speed, then forward/backward passes for accel/brake limits."""
+def speed_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake=None):
+    """Curvature-limited speed, then forward/backward passes for accel/brake limits.
+
+    a_lon is the speed-up (how soon the car gets going out of a corner), a_brake the slow-down
+    before one (defaults to a_lon). Keep a_brake at or below pure_pursuit's stop_decel, or the
+    car cannot slow down as fast as the CSV assumes and reaches corners too fast."""
+    a_brake = a_lon if a_brake is None else a_brake
     k = curvature(xy, closed)
     with np.errstate(divide='ignore'):
         v = np.minimum(vmax, np.sqrt(a_lat / np.maximum(k, 1e-6)))
@@ -89,7 +110,7 @@ def speed_profile(xy, closed, vmax, vmin, a_lat, a_lon):
             v[j] = min(v[j], np.sqrt(v[p] ** 2 + 2 * a_lon * ds[p]))
         for i in range(len(v) - 2, -1 if not closed else -2, -1):
             j, n = i % len(v), (i + 1) % len(v)
-            v[j] = min(v[j], np.sqrt(v[n] ** 2 + 2 * a_lon * ds[j]))
+            v[j] = min(v[j], np.sqrt(v[n] ** 2 + 2 * a_brake * ds[j]))
     return np.maximum(v, vmin)
 
 

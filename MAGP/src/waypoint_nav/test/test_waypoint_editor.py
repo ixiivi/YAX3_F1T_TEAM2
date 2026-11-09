@@ -15,13 +15,16 @@ os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 from waypoint_nav import path_tools as pt  # noqa: E402
 from waypoint_nav import waypoint_editor as we  # noqa: E402
 
-ARGS = types.SimpleNamespace(vmax=3.0, vmin=0.5, alat=2.0, alon=1.5)
+ARGS = types.SimpleNamespace(vmax=3.0, vmin=0.5, alat=2.0, alon=1.5, wall_clearance=0.40)
 
 
 @pytest.fixture
 def editor(tmp_path, monkeypatch):
     """Factory: an Editor on the lobby map. route=True starts from a copy of its saved route."""
     monkeypatch.setattr(we, 'WP_DIR', str(tmp_path))
+    from PyQt5 import QtCore
+    ini = str(tmp_path / 'settings.ini')      # saving must not touch the real ~/.config/MAGP
+    monkeypatch.setattr(we, 'settings', lambda: QtCore.QSettings(ini, QtCore.QSettings.IniFormat))
     made = []
 
     def make(route=False):
@@ -191,3 +194,81 @@ def test_reopening_and_saving_stays_close_to_every_saved_route(path):
     again, _ = pt.smooth_path(handles, closed)
     line = np.vstack([saved, saved[:1]]) if closed else saved
     assert max(we.distance_to_polyline(p, line) for p in again) < 2 * pt.HANDLE_TOLERANCE
+
+
+def test_smoothing_eases_curves_keeps_walls_and_undoes(editor):
+    ed = editor(route=True)
+    ed.smooth()   # builds the clearance map
+    key(ed, 'z')
+    held = list(ed.pts)
+    k0, _ = ed.path_stats()
+    gap0 = ed.path_clearance().min()
+    for _ in range(3):
+        ed.smooth()
+    k1, _ = ed.path_stats()
+    assert k1 < k0                                    # the sharpest curve got gentler
+    assert ed.path_clearance().min() >= min(gap0, ARGS.wall_clearance) - 0.05
+    for _ in range(3):
+        key(ed, 'z')
+    assert ed.pts == held
+
+
+def test_smoothing_keeps_the_ends_of_an_open_path(editor):
+    ed = editor()
+    pts = square(ed)
+    key(ed, 'c')                                      # open path
+    ed.smooth()
+    assert np.allclose(ed.pts[0], pts[0], atol=ed.res) and np.allclose(ed.pts[-1], pts[-1], atol=ed.res)
+
+
+def test_keep_off_walls_pushes_a_route_that_touches_a_wall(editor):
+    ed = editor(route=True)
+    ed.clearance = we.clearance_map(ed.img, ed.res)
+    # drag one point onto the nearest wall pixel, so the route touches the wall
+    walls = np.argwhere(ed.img < we.FREE_MIN)
+    i = len(ed.pts) // 2
+    u, v = we.world_to_px(*ed.pts[i], ed.h, ed.res, ed.origin)
+    r, c = walls[np.argmin(np.hypot(walls[:, 0] - v, walls[:, 1] - u))]
+    ed.pts[i] = we.px_to_world(c, r, ed.h, ed.res, ed.origin)
+    ed.redraw()
+    held = list(ed.pts)
+    before = ed.path_clearance().min()
+    assert before < 0.1
+    ed.keep_off_walls()
+    after = ed.path_clearance().min()
+    assert after > before + 0.2                       # well off the wall now
+    assert after >= ARGS.wall_clearance - 0.05 or after > 0.25   # target, or a narrow passage's middle
+    key(ed, 'z')
+    assert ed.pts == held
+
+
+def test_keep_off_walls_leaves_a_clear_route_alone(editor):
+    ed = editor(route=True)
+    ed.clearance = we.clearance_map(ed.img, ed.res)
+    ed.args = types.SimpleNamespace(**{**vars(ARGS), 'wall_clearance': 0.01})
+    held, steps = list(ed.pts), len(ed.history)
+    ed.keep_off_walls()
+    assert ed.pts == held and len(ed.history) == steps
+
+
+def test_lateral_and_speed_up_values_come_back_after_save_and_reopen(editor, tmp_path, monkeypatch):
+    from PyQt5 import QtCore
+    ini = str(tmp_path / 'settings.ini')
+    monkeypatch.setattr(we, 'settings', lambda: QtCore.QSettings(ini, QtCore.QSettings.IniFormat))
+    monkeypatch.setattr(we, 'WP_DIR', str(tmp_path))
+
+    def fresh():
+        args = types.SimpleNamespace(vmax=6.0, vmin=0.5, alat=None, alon=None, abrake=1.5,
+                                     wall_clearance=0.40)
+        return we.Editor(map_path('lobby'), None, args)
+    shutil.copy(waypoint_path('lobby'), tmp_path / 'lobby_wp.csv')
+    ed = fresh()
+    assert ed.args.alat == we.LIMIT_DEFAULTS['alat'] and ed.args.alon == we.LIMIT_DEFAULTS['alon']
+    ed.limit_boxes['alat'].setValue(2.75)
+    ed.limit_boxes['alon'].setValue(4.0)
+    ed.save()
+    we.plt.close(ed.fig)
+    again = fresh()
+    assert again.args.alat == 2.75 and again.args.alon == 4.0
+    assert again.limit_boxes['alat'].value() == 2.75 and again.limit_boxes['alon'].value() == 4.0
+    we.plt.close(again.fig)

@@ -41,6 +41,7 @@ LOG_LINES = 9
 FONT_SCALE = 0.63    # the desktop text scale is 2x, which is too large for a third of a screen
 DRIVE_ROW_H = 48     # [px] height of the keyboard / gamepad / E-STOP row
 DRIVE_ICON_W = 56    # [px] width of the keyboard and gamepad buttons
+TAB_FONT_SCALE = 0.85   # log tab titles, a little smaller than the rest of the panel
 STATUS_CARD = 'padding:2px 6px; border-radius:4px; color:white;'
 ERPM_GAIN = 4353.0   # speed_to_erpm_gain in vesc.yaml
 REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
@@ -319,11 +320,15 @@ class Panel(QtWidgets.QWidget):
         self.rest_v = None         # smoothed pack voltage at low current, for the charge estimate
 
         self.tabs = nofocus(QtWidgets.QTabWidget())
+        f = self.tabs.tabBar().font()
+        f.setPointSizeF(f.pointSizeF() * TAB_FONT_SCALE)
+        self.tabs.tabBar().setFont(f)
         self.procs = {}
-        for key, label in [('bringup', '드라이버'), ('slam', 'SLAM'), ('localize', '위치 추정'),
-                           ('pp', '자율주행'), ('rviz', 'RViz'), ('editor', '웨이포인트 편집'),
-                           ('map_editor', '맵 편집'), ('tool', '맵 저장/위치 찾기'),
-                           ('joy', '조이스틱')]:
+        # short tab names, so all the log tabs fit beside each other, in the order they are used.
+        # 맵·위치 shows 맵 저장 (right after SLAM) and 위치 찾기 (after AMCL)
+        for key, label in [('bringup', 'Driver'), ('slam', 'SLAM'), ('localize', 'AMCL'),
+                           ('tool', '맵·위치'), ('rviz', 'RViz'), ('map_editor', '맵 편집'),
+                           ('editor', '웨이포인트'), ('pp', '자율주행'), ('joy', '조이스틱')]:
             log = QtWidgets.QPlainTextEdit(readOnly=True)
             log.setMaximumBlockCount(3000)
             log.setFont(fixed_font())
@@ -426,9 +431,9 @@ class Panel(QtWidgets.QWidget):
         g = QtWidgets.QGridLayout(box)
         g.setVerticalSpacing(2)
         self.run_btn = {}
-        for r, (key, label, tip) in enumerate([('bringup', '드라이버', '라이다 + VESC'),
+        for r, (key, label, tip) in enumerate([('bringup', 'Driver', '라이다 + VESC'),
                                                ('slam', 'SLAM', '맵 만들기'),
-                                               ('localize', '위치 추정', 'AMCL'),
+                                               ('localize', 'AMCL', '위치 추정'),
                                                ('rviz', 'RViz', '')]):
             name = QtWidgets.QLabel(label)
             name.setToolTip(tip)
@@ -467,7 +472,7 @@ class Panel(QtWidgets.QWidget):
         g.addWidget(QtWidgets.QLabel('웨이포인트'), 0, 0)
         g.addWidget(self.wp_cb, 0, 1, 1, 3)
         g.addWidget(QtWidgets.QLabel('최고 속도'), 1, 0)
-        self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=3.0, singleStep=0.1, value=1.0,
+        self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=6.0, singleStep=0.1, value=1.0,
                                              suffix=' m/s')
         g.addWidget(self.vmax, 1, 1, 1, 3)
         self.reloc_btn = self._button('위치 찾기', self.relocalize)
@@ -886,7 +891,12 @@ def apply_style(app):
     app.setStyleSheet('QPushButton { padding: 1px 6px; }'
                       'QGroupBox { border: 1px solid palette(mid); border-radius: 5px;'
                       ' margin-top: 1.2em; }'
-                      'QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 2px; }')
+                      'QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 2px; }'
+                      # log tabs: tight padding so more of them fit without scrolling the tab bar
+                      'QTabBar::tab { padding: 3px 4px; margin-right: 1px; border: 1px solid palette(mid);'
+                      ' border-bottom: none; border-top-left-radius: 4px; border-top-right-radius: 4px;'
+                      ' background: palette(button); }'
+                      'QTabBar::tab:selected { background: palette(base); font-weight: bold; }')
 
 
 def main():
