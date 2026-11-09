@@ -64,8 +64,8 @@ def bare_pp():
     from waypoint_nav.pure_pursuit import PurePursuit
     pp = object.__new__(PurePursuit)
     pp.wheelbase, pp.max_steer = 0.33, 0.34
-    pp.aeb_half_width, pp.aeb_base, pp.aeb_time = 0.26, 0.35, 0.4
-    pp.car_front, pp.car_rear, pp.car_half_width = 0.42, 0.08, 0.21
+    pp.aeb_half_width, pp.aeb_base, pp.aeb_delay, pp.aeb_decel = 0.145, 0.01, 0.15, 3.0
+    pp.car_front, pp.car_rear, pp.car_half_width = 0.42, 0.08, 0.135
     pp.laser_x = 0.267
     pp.min_speed, pp.min_speed_per_rad = 0.5, 1.0
     pp.accel, pp.stop_decel, pp.dt = 1.5, 2.0, 1.0 / 40

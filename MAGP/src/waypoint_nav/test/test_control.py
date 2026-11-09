@@ -22,7 +22,8 @@ def test_aeb_sees_a_point_on_the_arc(bare_pp, steer, s):
     bare_pp.scan_xy = np.array([arc_point(steer, s)])
     hit = bare_pp.arc_obstacle(steer, reach=2.0)
     assert hit is not None, f'AEB blind at steer {steer:+.2f}'
-    assert hit == pytest.approx(s, abs=0.01)
+    # the body reaches a point on the arc a little before base_link's arc length says
+    assert s - 0.04 <= hit <= s + 0.005
 
 
 @pytest.mark.parametrize('steer', [0.1, 0.3])
@@ -64,3 +65,21 @@ def test_ramp_respects_accel(bare_pp):
     bare_pp.speed_cmd = 0.5
     nxt = bare_pp.ramp(2.0)
     assert nxt - 0.5 == pytest.approx(bare_pp.accel * bare_pp.dt)
+
+
+def test_aeb_ignores_a_wall_beside_the_front_corner(bare_pp):
+    # a wall 3-8 cm outside the front corner, running along the car: turning away from it is free
+    wall = np.array([[x, -(0.135 + 0.03)] for x in np.arange(0.0, 0.8, 0.01)])
+    bare_pp.scan_xy = wall
+    assert bare_pp.arc_obstacle(0.34, 0.42 + 0.5) is None
+    # turning into it is not
+    assert bare_pp.arc_obstacle(-0.34, 0.42 + 0.5) is not None
+
+
+def test_escape_picks_the_free_steering_closest_to_the_wanted_one(bare_pp):
+    # a wall corner 20 cm ahead reaching just under the right side of the car: left gets past it
+    bare_pp.scan_xy = np.array([[0.62, y] for y in np.arange(-0.5, -0.12, 0.01)])
+    assert bare_pp.arc_obstacle(0.0, 1.0) is not None
+    alt = bare_pp.escape_steer(0.0, 0.42 + 0.3)
+    assert alt is not None and alt > 0.0
+    assert bare_pp.arc_obstacle(alt, 0.42 + 0.3) is None

@@ -89,27 +89,44 @@ class PurePursuit(Node):
         p('wheelbase', 0.33)
         p('max_steer', 0.34)
         # AEB: stop if a scan point lies on the arc the car is about to drive (current steering),
-        # within base + v * aeb_time metres and aeb_half_width of the arc
+        # within the stopping distance (aeb_base + v * aeb_delay + v^2 / 2 aeb_decel) ahead of the
+        # bumper and aeb_half_width of the arc. Tight on purpose (2026-11-09): 1 cm at standstill
+        # and beside the body, so the car is not frozen by a wall it would not touch
         # car body around base_link (rear axle centre), measured 2026-11-03
         p('car_front', 0.42)         # [m] front bumper ahead of base_link (wheelbase 0.33 + 0.09)
         p('car_rear', 0.08)          # [m] rear bumper behind base_link
-        p('car_half_width', 0.21)    # [m] (width 0.42)
-        p('aeb_base', 0.35)          # [m] gap kept ahead of the front bumper
-        p('aeb_time', 0.4)           # [s]
-        p('aeb_half_width', 0.26)    # [m] half car width 0.21 + margin
+        p('car_half_width', 0.135)   # [m] (width 0.27 over the wheels, measured 2026-11-09)
+        p('aeb_base', 0.01)          # [m] gap kept ahead of the front bumper at standstill
+        p('aeb_delay', 0.15)         # [s] scan + command latency before the brake acts
+        p('aeb_decel', 3.0)          # [m/s^2] braking assumed for the stopping distance
+        p('aeb_half_width', 0.145)   # [m] half car width 0.135 + 1 cm
         p('laser_x', 0.267)          # laser position ahead of base_link [m] (6.3 cm behind front axle)
         p('pose_timeout', 0.5)       # [s]
-        p('accel', 1.5)              # [m/s^2] speed-up limit
-        p('stop_decel', 2.0)         # [m/s^2] motor-controlled slow-down for space / slower corners
+        p('accel', 3.5)              # [m/s^2] speed-up limit (the CSV's corner-exit speed-up is 3.0)
+        p('stop_decel', 3.0)         # [m/s^2] motor-controlled slow-down for space / slower corners
+        # target the CSV speed this far ahead [s of driving]: speeds up before the faster part
+        # and honours any slower point within it early. Off by default: in a lap simulation
+        # (2026-11-09) 0.3 s made every corner apex 0.3-0.4 m/s too fast for the CSV's lateral
+        # limit. Corner exits already speed up from the apex at accel. Use it only if the real
+        # car visibly lags the CSV speeds. 0 = off
+        p('speed_preview', 0.0)
         p('rate', 40.0)
         p('autostart', False)        # start driving without pressing enter (simulation tests)
         # obstacle bypass
         p('avoid_enabled', True)
         p('avoid_max_offset', 0.6)   # [m] furthest sideways shift from the line
-        p('avoid_clearance', 0.36)   # [m] path to obstacle / wall: half width 0.21 + margin
-        p('avoid_slope', 0.5)        # sideways metres per metre driven while shifting
-        p('avoid_horizon', 3.0)      # [m] how far ahead a shifted path must be free
-        p('avoid_speed', 1.0)        # [m/s] speed cap while shifted
+        p('avoid_clearance', 0.185)  # [m] path to obstacle / wall: half width 0.135 + 5 cm (tracking error)
+        p('avoid_slope', 0.5)        # sideways metres per metre driven while shifting, at most
+        p('avoid_horizon', 3.0)      # [m] how far ahead a shifted path must be free, at least
+        # race, do not crawl (2026-11-09): look further ahead the faster the car goes, shift at a
+        # steady sideways speed (so earlier and longer at speed), take the side with more room,
+        # and keep the raceline speed while shifted. 0 restores the fixed values above.
+        p('avoid_time', 1.5)         # [s] horizon = speed x this, from avoid_horizon ...
+        p('avoid_horizon_max', 5.0)  # [m] ... up to this (the scan is used out to 5 m)
+        p('avoid_lat_speed', 0.8)    # [m/s] sideways speed while shifting
+        p('avoid_room_weight', 2.0)  # prefer the shift with more room to obstacles and walls ...
+        p('avoid_room_cap', 0.6)     # [m] ... up to this much room
+        p('avoid_speed', 0.0)        # [m/s] speed cap while shifted; 0 = keep the raceline speed
         # scan points further than this from any map wall are obstacles; generous, because a few
         # cm of AMCL error already moves wall points off the mapped walls
         # what counts as an obstacle. 'track': clusters of scan points that the map does not explain,
@@ -124,6 +141,26 @@ class PurePursuit(Node):
         p('obs_min_points', 6)       # fewer points is noise (ForzaETH uses 10; 6 keeps far cones)
         p('obs_max_size', 0.5)       # [m] longer clusters are walls, not objects
         p('obstacle_min_map_dist', 0.25)
+        # no free way around (ForzaETH state machine style): trail the obstacle instead of
+        # stopping, and when stuck behind it for a while, escape towards the widest gap
+        # AEB holding the car in front of a map wall (e.g. pushed into a corner): back off a
+        # little, steering so the nose turns towards the route, and drive on. Needs reverse_enabled.
+        p('aeb_backoff_after', 0.75) # [s] AEB stop this long first (halved 2026-11-09)
+        p('aeb_backoff_dist', 0.10)  # [m] each back-off, at least ...
+        p('aeb_backoff_max_dist', 0.50)  # [m] ... and on until a forward way is free, at most
+        p('aeb_escape', True)        # AEB blocked: creep on with the closest free steering instead
+        p('aeb_escape_speed', 1.2)   # [m/s] escape / follow-the-gap speed while the pose is good ...
+        p('aeb_escape_fit', 0.7)     # ... (map fit at least this); otherwise min_speed
+        p('aeb_escape_dist', 0.50)   # [m] ... whose path is free at least this far past the bumper
+        p('aeb_clear_time', 0.5)     # [s] AEB free this long before the hold timer starts over
+        p('aeb_backoff_max', 6)      # back-offs in a row before only waiting
+        p('trail_gap', 0.5)          # [m] bumper to obstacle distance kept while trailing
+        p('trail_gain', 1.0)         # [1/s] speed per metre of gap beyond trail_gap
+        p('trail_lane', 0.36)        # [m] obstacles this close to the followed line are in the way
+        p('ftg_after', 1.5)          # [s] stopped behind an obstacle this long: follow the gap (halved 2026-11-09)
+        p('ftg_time', 2.0)           # [s] length of one follow-the-gap escape
+        p('ftg_fov_deg', 70.0)       # [deg] half angle searched for the gap
+        p('ftg_min_range', 1.0)      # [m] beams shorter than this are no gap
         # pose skew self-correction (legacy race_stack): when the pose is off, every wall return
         # lands off the mapped walls and turns into an obstacle. The median distance of the scan
         # points to the walls measures that offset on every scan; the threshold is raised by it.
@@ -153,13 +190,13 @@ class PurePursuit(Node):
         p('reverse_speed', 1.0)      # [m/s]
         p('reverse_timeout', 3.0)    # [s]
         p('reverse_settle', 0.1)     # [s] brake at least this long before reversing
-        p('reverse_settle_max', 2.0) # [s] reverse after this even if odom still reports motion
+        p('reverse_settle_max', 1.0) # [s] reverse after this even if odom still reports motion
         p('search_settle', 0.1)      # [s] the pose search uses a scan at least this much newer
         p('verify_time', 0.3)        # [s] AMCL gets this long with the new pose before the check
         p('align_gain', 0.6)         # steering per rad of angle to the side wall while reversing
         p('max_attempts', 3)         # recoveries in a row without progress before no more reverse
         p('progress_dist', 1.0)      # [m] driven past the trouble spot for it to count as progress
-        p('retry_wait', 5.0)         # [s] blocked this long after max_attempts: back up again
+        p('retry_wait', 2.5)         # [s] blocked this long after max_attempts: back up again
         # hit detection, LiDAR only: wheels can spin freely against a wall, so odometry cannot tell
         p('contact_band', 0.03)      # [m] points this close to the body count as contact ...
         p('contact_front_x', 0.25)   # ... only from here forward [m]: front wheels (axle 0.33,
@@ -206,7 +243,7 @@ class PurePursuit(Node):
         self.min_speed_per_rad = gp('min_speed_per_rad')
         self.ld_min, self.ld_gain = gp('lookahead_min'), gp('lookahead_gain')
         self.wheelbase, self.max_steer = gp('wheelbase'), gp('max_steer')
-        self.aeb_base, self.aeb_time = gp('aeb_base'), gp('aeb_time')
+        self.aeb_base, self.aeb_delay, self.aeb_decel = gp('aeb_base'), gp('aeb_delay'), gp('aeb_decel')
         self.aeb_half_width, self.laser_x = gp('aeb_half_width'), gp('laser_x')
         self.car_front, self.car_rear = gp('car_front'), gp('car_rear')
         self.car_half_width = gp('car_half_width')
@@ -274,6 +311,14 @@ class PurePursuit(Node):
         self.scan_change = 0.0            # fraction of beams changed since frozen_ref
         self.skip_search = False          # this recovery only backs up: the pose was fine
         self.rev_blind = False            # backing up without a driven track to retrace
+        self.aeb_hit_pts = np.empty((0, 2))  # scan points the last AEB check stopped for
+        self.aeb_since = None             # AEB holding the car since
+        self.aeb_last = 0.0               # last cycle AEB stopped the car
+        self.backoffs = 0                 # AEB back-offs in a row
+        self.backoff_at = None            # odom position of the last back-off
+        self.rev_dist_override = None     # set by an AEB back-off: its distance ...
+        self.rev_want_steer = 0.0         # ... and the forward steering it backs off for
+        self.rev_steer_override = None    # ... and its fixed steering
         self.wait_since = None            # blocked with no reverse attempts left, since when
         self.wait_t0 = 0.0
         self.verify_at = 0.0
@@ -285,6 +330,10 @@ class PurePursuit(Node):
         self.plan = {}                    # last choose_offset result, for the run log
         self.skew = 0.0                   # pose skew added to the obstacle threshold [m]
         self.n_clusters = 0               # objects found by the track obstacle filter
+        self.last_obs = None              # obstacle points of the last plan, for trailing
+        self.cur_slope = 0.5              # sideways shift per metre in use (set by choose_offset)
+        self.trail_stop_since = None      # stopped behind an obstacle since
+        self.ftg_until = 0.0              # follow-the-gap escape running until
         self.pose_seen = None
         self.err_seen = None
         self.events = []
@@ -299,6 +348,7 @@ class PurePursuit(Node):
         self.running = True
         self.idx = None  # re-acquire the nearest waypoint
         self.mode = 'drive'
+        self.aeb_since = None
         self.low_since = None
         self.frozen_ref = None
         self.contact_scans = 0
@@ -364,16 +414,19 @@ class PurePursuit(Node):
         ang = scan.angle_min + np.arange(len(r)) * scan.angle_increment
         ok = np.isfinite(r) & (r > scan.range_min) & (r < 5.0)
         xy = np.column_stack([self.laser_x + r[ok] * np.cos(ang[ok]), r[ok] * np.sin(ang[ok])])
-        # drop returns from the car itself (wheels, body) so they never count as obstacles
-        m = 0.03
+        # drop returns from the car itself (wheels, body) so they never count as obstacles;
+        # 1 cm, so a wall 1-3 cm from the bumper is still seen by AEB
+        m = 0.01
         body = ((xy[:, 0] > -self.car_rear - m) & (xy[:, 0] < self.car_front + m)
                 & (np.abs(xy[:, 1]) < self.car_half_width + m))
         self.scan_xy = xy[~body]
         # hit signal: points in a thin band around the front wheels and the bumper. A wall along
         # the side or behind is not a hit: the car can drive on past it
         m += self.gp('contact_band')
+        # sideways only the AEB width (1 cm): a wall the front corner is passing diagonally is
+        # not a hit (it reversed the car out of every escape past a wall corner, sim 2026-11-09)
         near = ((xy[:, 0] > self.gp('contact_front_x')) & (xy[:, 0] < self.car_front + m)
-                & (np.abs(xy[:, 1]) < self.car_half_width + m))
+                & (np.abs(xy[:, 1]) < self.aeb_half_width))
         self.contact_xy = xy[near & ~body]
         self.contact_front = self.contact_xy[self.contact_xy[:, 0] > self.car_front]
         enough = len(self.contact_xy) >= self.gp('contact_points')
@@ -395,7 +448,7 @@ class PurePursuit(Node):
         """scan_rays without the returns from the car body (they are not on the map)."""
         r, a = scan_rays(scan, step=step)
         x, y = self.laser_x + r * np.cos(a), r * np.sin(a)
-        m = 0.03
+        m = 0.01
         body = ((x > -self.car_rear - m) & (x < self.car_front + m)
                 & (np.abs(y) < self.car_half_width + m))
         return r[~body], a[~body]
@@ -429,21 +482,61 @@ class PurePursuit(Node):
         self.drive(0.0, 0.0)
 
     # ---------- geometry ----------
-    def arc_obstacle(self, steer, reach):
-        """Distance along the arc driven with this steering to the first scan point on it."""
-        x, y = self.scan_xy[:, 0], self.scan_xy[:, 1]
+    def arc_obstacle(self, steer, reach, step=0.02):
+        """Drive the car body (rectangle, aeb_half_width wide) forward along the arc of this
+        steering, step by step, until the front bumper has gone reach - car_front. Returns
+        car_front + the distance driven when it first covers a scan point, or None.
+
+        The body, not a band around the rear-axle arc: in a tight turn that band is already ~9 cm
+        to the side at the bumper and caught walls beside the front corner that the car never
+        touches ("0.00 m ahead" stops, 2026-11-09). Points the body already overlaps at the start
+        (alongside it, within the 1 cm margin) are not in the way either."""
+        self.aeb_hit_pts = np.empty((0, 2))
+        travel = reach - self.car_front
+        p = self.scan_xy
+        if travel <= 0.0 or len(p) == 0:
+            return None
+        hw, front, rear = self.aeb_half_width, self.car_front, self.car_rear + 0.01
+        # only points the body can reach at all
+        p = p[np.hypot(p[:, 0], p[:, 1]) < reach + hw + 0.1]
+        if len(p) == 0:
+            return None
+
+        def inside(bx, by):
+            return (bx > -rear) & (bx < front) & (np.abs(by) < hw)
+
+        p = p[~inside(p[:, 0], p[:, 1])]
+        if len(p) == 0:
+            return None
         k = math.tan(steer) / self.wheelbase
-        if abs(k) < 1e-3:
-            s, lat = x, np.abs(y)
+        d = np.arange(step, travel + step * 0.5, step)
+        if abs(k) < 1e-6:
+            px, py, th = d, np.zeros_like(d), np.zeros_like(d)
         else:
-            R = 1.0 / k  # turn centre at (0, R)
-            lat = np.abs(np.hypot(x, y - R) - abs(R))
-            # angle swept around the centre; dividing x by R would flip it for right turns
-            s = abs(R) * np.arctan2(x, (R - y) * math.copysign(1.0, R))
-        # only what lies ahead of the bumper: a wall already alongside the body is not in the way
-        # (counting it froze the car next to inner walls, 2026-11-08)
-        hit = (lat < self.aeb_half_width) & (s > self.car_front) & (s < reach)
-        return float(s[hit].min()) if hit.any() else None
+            th = k * d
+            px, py = np.sin(th) / k, (1.0 - np.cos(th)) / k
+        c, s = np.cos(th)[:, None], np.sin(th)[:, None]
+        dx, dy = p[None, :, 0] - px[:, None], p[None, :, 1] - py[:, None]
+        hit = inside(c * dx + s * dy, -s * dx + c * dy)   # (steps, points)
+        steps = hit.any(axis=1)
+        if not steps.any():
+            return None
+        first = int(np.argmax(steps))
+        self.aeb_hit_pts = p[hit[first]]
+        return float(front + d[first] - step)
+
+    def escape_steer(self, steer, reach):
+        """The steering closest to the wanted one whose path is free for reach, or None. Lets the
+        car creep round a wall corner instead of stopping in front of it."""
+        best = None
+        for cand in np.linspace(-self.max_steer, self.max_steer, 13):
+            if best is not None and abs(cand - steer) >= abs(best - steer):
+                continue
+            keep = self.aeb_hit_pts
+            if self.arc_obstacle(float(cand), reach) is None:
+                best = float(cand)
+            self.aeb_hit_pts = keep
+        return best
 
     def pursuit_steer(self, x, y, yaw, tx, ty):
         """Pure pursuit steering towards (tx, ty); also right for a target behind the car."""
@@ -481,7 +574,7 @@ class PurePursuit(Node):
         """Line points for a bypass: shift from self.offset to goal, hold it up to `release`
         metres ahead (just past the obstacle), then come back to the line. Sideways change is
         limited to avoid_slope per metre along the path."""
-        slope = self.gp('avoid_slope')
+        slope = self.cur_slope
         off = np.empty(len(s))
         cur = self.offset
         for k in range(len(s)):
@@ -547,9 +640,167 @@ class PurePursuit(Node):
             return None
         return np.column_stack([px[new], py[new]])
 
+    def trail_gap_ahead(self, i, x, y):
+        """Distance from the bumper along the route to the nearest obstacle point in the lane
+        of the followed line, or None."""
+        obs = getattr(self, 'last_obs', None)
+        if obs is None or len(obs) == 0:
+            return None
+        _, j = self.route_tree.query(obs)
+        d = ((obs - self.xy[j]) * self.normal[j]).sum(1)
+        in_lane = np.abs(d - self.offset) < self.gp('trail_lane')
+        if not in_lane.any():
+            return None
+        n = len(self.xy)
+        ahead = (j[in_lane] - i) % n if self.closed else j[in_lane] - i
+        ahead = ahead[(ahead >= 0) & (ahead < n // 2)]
+        if len(ahead) == 0:
+            return None
+        return float(ahead.min() * np.median(self.seg) - self.car_front)
+
+    def gap_heading(self):
+        """Steering angle towards the middle of the widest free sector ahead, or None."""
+        p = self.scan_xy
+        if len(p) == 0:
+            return None
+        ang = np.degrees(np.arctan2(p[:, 1], p[:, 0] - self.laser_x))
+        rng = np.hypot(p[:, 0] - self.laser_x, p[:, 1])
+        fov = self.gp('ftg_fov_deg')
+        bins = np.arange(-fov, fov + 1e-9, 1.0)
+        near = np.full(len(bins), np.inf)
+        k = np.round(ang + fov).astype(int)
+        ok = (k >= 0) & (k < len(bins))
+        np.minimum.at(near, k[ok], rng[ok])
+        free = near > self.gp('ftg_min_range')
+        best, run = None, None
+        for b in range(len(bins) + 1):
+            if b < len(bins) and free[b]:
+                run = b if run is None else run
+            elif run is not None:
+                if best is None or b - run > best[1] - best[0]:
+                    best = (run, b)
+                run = None
+        if best is None:
+            return None
+        aim = math.radians(bins[(best[0] + best[1] - 1) // 2])
+        return self.clamp_steer(math.atan2(2.0 * self.wheelbase * math.sin(aim), 1.0))
+
+    def aeb_reach(self, v):
+        """Arc length from base_link the AEB checks at speed v: bumper + stopping distance."""
+        v = max(v, 0.0)
+        return self.car_front + self.aeb_base + v * self.aeb_delay + v * v / (2.0 * self.aeb_decel)
+
+    def escape_speed(self):
+        """Speed for escapes into free space: faster while the pose is good (the steering it
+        aims with comes from the route), the lowest speed otherwise."""
+        good = self.fit is not None and self.fit >= self.gp('aeb_escape_fit')
+        return max(self.gp('aeb_escape_speed'), self.min_speed) if good else self.min_speed
+
+    def aeb_clear(self, now):
+        """The arc is free this cycle. The hold timer only starts over once it has stayed free
+        for a while: a single free cycle (the steering swinging the arc off a wall) reset it on
+        every try, and the back-off never came (2026-11-09 log, car on a wall for 10 s)."""
+        if self.aeb_since is not None and now - self.aeb_last > self.gp('aeb_clear_time'):
+            self.aeb_since = None
+
+    def aeb_stop(self, steer, hit, x, y, yaw):
+        """AEB stop; held for aeb_backoff_after in front of a map wall, back off a little instead."""
+        now = time.monotonic()
+        if self.gp('aeb_escape'):
+            # the wanted arc is blocked: if another steering is free a little way, creep along it
+            # at the lowest speed and look again next cycle (the wall corner passes by)
+            hit_pts = self.aeb_hit_pts
+            v_esc = self.escape_speed()
+            reach = max(self.aeb_reach(max(self.speed_cmd, self.floor(v_esc, self.max_steer))),
+                        self.car_front + self.gp('aeb_escape_dist'))
+            alt = self.escape_steer(steer, reach)
+            self.aeb_hit_pts = hit_pts
+            if alt is not None:
+                self.speed_cmd = min(self.speed_cmd, v_esc) if self.speed_cmd > v_esc else self.ramp(v_esc)
+                v = self.floor(self.speed_cmd, alt)
+                self.status = (f'AEB escape: st {alt:+.2f} instead of {steer:+.2f} '
+                               f'(blocked {hit - self.car_front:.2f} m ahead)')
+                self.drive(v, alt)
+                self.record_trail()
+                return
+        self.aeb_since = self.aeb_since or now
+        self.aeb_last = now
+        odom = self.lookup('odom')
+        if (self.gp('reverse_enabled') and odom is not None
+                and now - self.aeb_since >= self.gp('aeb_backoff_after')
+                and self.backoffs < self.gp('aeb_backoff_max')
+                and self.on_wall(self.aeb_hit_pts, x, y, yaw) >= self.gp('contact_points')):
+            self.backoffs += 1
+            self.aeb_since = None
+            self.backoff_at = odom
+            # backing up with the wheels turned away from the route swings the nose towards it
+            self.rev_steer_override = (-math.copysign(self.max_steer, steer)
+                                       if abs(steer) > 0.02 else 0.0)
+            self.rev_dist_override = self.gp('aeb_backoff_dist')
+            self.rev_want_steer = steer
+            self.skip_search, self.rev_blind = True, True
+            self.mode = 'reverse'
+            self.rev_start, self.rev_t0, self.rev_last = None, now, odom
+            self.event(f'벽 앞에서 AEB {self.gp("aeb_backoff_after"):.1f}초 정지 → '
+                       f'앞길이 열릴 때까지 후진 ({self.rev_dist_override * 100:.0f}~'
+                       f'{self.gp("aeb_backoff_max_dist") * 100:.0f} cm), 조향 {self.rev_steer_override:+.2f} '
+                       f'({self.backoffs}/{self.gp("aeb_backoff_max")})')
+            return
+        return self.stop(f'AEB obstacle {hit - self.car_front:.2f} m ahead of bumper')
+
+    def trail_or_escape(self, i, x, y, yaw, v_ref, now):
+        """No shift is free: drive the current line behind the obstacle, keeping trail_gap;
+        after ftg_after seconds stopped, steer into the widest gap at the lowest speed."""
+        if now < getattr(self, 'ftg_until', 0.0):
+            steer = self.gap_heading()
+            if steer is not None:
+                v_esc = self.ramp(self.escape_speed())
+                hit = self.arc_obstacle(steer, self.aeb_reach(self.floor(v_esc, steer)))
+                if hit is None:
+                    v = self.floor(v_esc, steer)
+                    self.speed_cmd = v_esc
+                    self.status = f'FTG: escaping towards the widest gap, st {steer:+.2f}'
+                    self.drive(v, steer)
+                    self.record_trail()
+                    return
+            self.ftg_until = 0.0
+        gap = self.trail_gap_ahead(i, x, y)
+        v = v_ref if gap is None else max(0.0, min(v_ref, self.gp('trail_gain') * (gap - self.gp('trail_gap'))))
+        if v < self.min_speed * 0.5:
+            self.trail_stop_since = getattr(self, 'trail_stop_since', None) or now
+            if now - self.trail_stop_since > self.gp('ftg_after'):
+                self.trail_stop_since = None
+                self.ftg_until = now + self.gp('ftg_time')
+                self.event('장애물 뒤에서 오래 막힘 → 가장 넓은 빈 방향으로 빠져나가기')
+            gap_txt = 'none' if gap is None else f'{gap:.2f} m'
+            return self.stop(f'TRAILING: stopped behind the obstacle, gap {gap_txt}')
+        self.trail_stop_since = None
+        idx, _ = self.ahead(i, self.ld_min + self.ld_gain * v + 1.0)
+        line = self.xy[idx] + self.normal[idx] * self.offset
+        d = np.hypot(line[:, 0] - x, line[:, 1] - y)
+        ld = self.ld_min + self.ld_gain * v
+        k = int(np.argmax(d >= ld)) if (d >= ld).any() else len(line) - 1
+        steer = self.clamp_steer(self.pursuit_steer(x, y, yaw, *line[k]))
+        hit = self.arc_obstacle(steer, self.aeb_reach(self.floor(self.ramp(v), steer) if v > 0 else 0.0))
+        if hit is not None:
+            return self.aeb_stop(steer, hit, x, y, yaw)
+        self.speed_cmd = self.ramp(v)
+        out = self.floor(self.speed_cmd, steer) if self.speed_cmd > 0 else 0.0
+        self.status = f'TRAILING: gap {gap if gap is not None else float("nan"):.2f} m, v {out:.2f}'
+        self.drive(out, steer)
+        if out > 0.0:
+            self.record_trail()
+
     def choose_offset(self, i, x, y, yaw):
         """Smallest sideways shift whose path ahead is free; None if every shift is blocked."""
-        idx, s = self.ahead(i, self.gp('avoid_horizon'))
+        v = max(getattr(self, 'v_plan', self.min_speed), self.min_speed)
+        horizon = self.gp('avoid_horizon')
+        if self.gp('avoid_time') > 0.0:
+            horizon = min(max(horizon, v * self.gp('avoid_time')), self.gp('avoid_horizon_max'))
+        self.cur_slope = self.gp('avoid_slope')
+        if self.gp('avoid_lat_speed') > 0.0:
+            self.cur_slope = min(self.cur_slope, self.gp('avoid_lat_speed') / v)
+        idx, s = self.ahead(i, horizon)
         clear, m = self.gp('avoid_clearance'), self.gp('avoid_max_offset')
         obs = self.obstacles_map(x, y, yaw)
         tree, release = None, -1.0
@@ -577,8 +828,13 @@ class PurePursuit(Node):
                 continue
             n_free += 1
             cost = abs(goal) + 0.5 * abs(goal - self.offset)
+            if tree is not None and release > 0.0:
+                room = min(float(tree.query(pts)[0].min()),
+                           float(self.matcher.wall_dist(pts[:, 0], pts[:, 1]).min()))
+                cost -= self.gp('avoid_room_weight') * min(room, self.gp('avoid_room_cap'))
             if cost < best_cost:
                 best, best_cost, best_line = float(goal), cost, pts
+        self.last_obs = obs
         self.plan = {'goal': best, 'n_obs': 0 if obs is None else len(obs),
                      'n_clusters': self.n_clusters,
                      'n_free': n_free, 'n_cand': len(goals)}
@@ -630,6 +886,17 @@ class PurePursuit(Node):
         if target > cur:
             return min(target, cur + self.accel * self.dt)
         return max(target, cur - self.stop_decel * self.dt)
+
+    def preview_speed(self, i):
+        """CSV speed to aim for at waypoint i, looking speed_preview seconds ahead."""
+        here = self.v_ref[i]
+        t = self.gp('speed_preview')
+        if t <= 0.0:
+            return here
+        idx, _ = self.ahead(i, max(self.speed_cmd, here) * t)
+        window = self.v_ref[idx]
+        # slower ahead: aim for the slowest one now. Faster ahead and nothing slower: go for it
+        return window.min() if window.min() < here else window[-1]
 
     def floor(self, v, steer):
         return math.copysign(max(abs(v), self.min_speed + self.min_speed_per_rad * abs(steer)), v)
@@ -726,7 +993,7 @@ class PurePursuit(Node):
         x, y, yaw = pose
         i, _ = self.nearest(x, y)
         goal, _, _ = self.choose_offset(i, x, y, yaw)
-        reach = self.car_front + self.aeb_base + max(self.v_ref[i], self.min_speed) * self.aeb_time
+        reach = self.aeb_reach(max(self.v_ref[i], self.min_speed))
         return goal is not None and self.contact_scans == 0 and self.arc_obstacle(0.0, reach) is None
 
     def note_progress(self):
@@ -822,6 +1089,14 @@ class PurePursuit(Node):
         why = None
         # without a driven track the space behind was never seen free: never back up further
         far = self.gp('reverse_dist') * (1 if self.rev_blind else self.attempts)
+        if self.rev_dist_override is not None:
+            far = self.rev_dist_override
+        if self.rev_dist_override is not None:
+            # AEB back-off: at least the minimum, then on until a steering forward is free
+            far = self.gp('aeb_backoff_max_dist')
+            if moved >= self.rev_dist_override and self.escape_steer(
+                    self.rev_want_steer, self.car_front + self.gp('aeb_escape_dist')) is not None:
+                far = moved
         if moved >= far:
             why = f'{moved:.2f} m'
         elif time.monotonic() - self.rev_t0 > self.gp('reverse_timeout'):
@@ -832,6 +1107,7 @@ class PurePursuit(Node):
             why = 'something behind'
         if why:
             self.stop(f'reverse done ({why})')
+            self.rev_dist_override = self.rev_steer_override = None
             if self.skip_search:
                 self.event(f'후진 완료 ({why}) → 재출발')
                 self.recovered_at = odom
@@ -844,6 +1120,8 @@ class PurePursuit(Node):
         if self.trail:
             tx, ty = self.trail[-1]
             steer += self.pursuit_steer(ox, oy, oyaw, tx, ty)
+        if self.rev_steer_override is not None:
+            steer = self.rev_steer_override
         steer = self.clamp_steer(steer)
         v = self.floor(-self.gp('reverse_speed'), steer)
         self.status = f'reverse {moved:.2f} m st {steer:+.2f}'
@@ -962,10 +1240,11 @@ class PurePursuit(Node):
         if not self.running and self.speed_cmd == 0.0:
             return self.stop(f'paused i {i}/{len(self.xy)} off-path {err:.2f} m')
 
-        v_ref = max(self.v_ref[i], self.min_speed)
+        v_ref = max(self.preview_speed(i), self.min_speed)
         self.v_want = v_ref
         ld = self.ld_min + self.ld_gain * v_ref
         if self.avoid_on:
+            self.v_plan = v_ref
             goal, here, line = self.choose_offset(i, x, y, yaw)
             now = time.monotonic()
             if goal is None and self.last_line is not None and now - self.blocked_since < 0.3:
@@ -974,16 +1253,18 @@ class PurePursuit(Node):
                 goal, here, line = self.offset, self.offset, self.last_line
                 v_ref = self.min_speed
             elif goal is None:
-                # nothing free: wait in place (running stays on, it drives on once clear)
+                # nothing free: trail the obstacle on the current line; stuck too long: follow
+                # the gap. Running stays on, the car goes round as soon as a shift is free.
                 self.last_line = None
                 self.publish_avoid(None)
-                return self.stop('BLOCKED: no free way around')
+                return self.trail_or_escape(i, x, y, yaw, v_ref, now)
             else:
                 self.last_line, self.blocked_since = line, now
+                self.trail_stop_since, self.ftg_until = None, 0.0
             # move the shift along with the distance driven
-            span = self.gp('avoid_slope') * max(self.speed_cmd, self.min_speed) * self.dt
+            span = self.cur_slope * max(self.speed_cmd, self.min_speed) * self.dt
             self.offset += max(-span, min(span, here - self.offset))
-            if abs(self.offset) > 0.05 or abs(here) > 0.05:
+            if self.gp('avoid_speed') > 0.0 and (abs(self.offset) > 0.05 or abs(here) > 0.05):
                 v_ref = min(v_ref, max(self.gp('avoid_speed'), self.min_speed))
             self.publish_avoid(line if abs(self.offset) > 0.01 or abs(here) > 0.01 else None)
         else:
@@ -996,12 +1277,18 @@ class PurePursuit(Node):
         steer = self.clamp_steer(self.pursuit_steer(x, y, yaw, tx, ty))
 
         v = self.ramp(v_ref if self.running else 0.0)
-        # reach from the speed it wants to drive, not the current one: otherwise the reach
-        # shrinks once AEB has stopped the car and it creeps on towards the obstacle
-        hit = self.arc_obstacle(steer, self.car_front + self.aeb_base + v_ref * self.aeb_time)
+        # reach from the command about to be sent (with its steering floor): while slowing down
+        # for a corner that is more than the target speed. From standstill the ramp jumps to
+        # min_speed, so a stopped car keeps a real stopping distance and does not creep
+        hit = self.arc_obstacle(steer, self.aeb_reach(self.floor(v, steer) if v > 0 else 0.0))
         if hit is not None:
-            return self.stop(f'AEB obstacle {hit - self.car_front:.2f} m ahead of bumper')
+            return self.aeb_stop(steer, hit, x, y, yaw)
 
+        self.aeb_clear(now=time.monotonic())
+        if self.backoffs and self.backoff_at is not None:
+            odom = self.lookup('odom')
+            if odom and math.hypot(odom[0] - self.backoff_at[0], odom[1] - self.backoff_at[1]) > 0.5:
+                self.backoffs, self.backoff_at = 0, None    # got away: back-offs start over
         self.speed_cmd = v
         if v > 0.0:
             # the ramp state stays as is; only the command gets the steering-dependent floor
