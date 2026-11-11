@@ -12,16 +12,27 @@ Mouse on the map:
   left click     add a point at the end
   drag a point   move it; the path follows while dragging
   drag the path  add a point there and move it
-  right click    remove the point under the cursor
+  drag elsewhere select the part of the path inside the box (Esc clears it); smoothing,
+                 keep-off-walls and the racing line then change only that part
+  right click    remove the point, mark or straight line under the cursor
   right drag     move the view
   wheel          zoom in / out at the cursor
+
+Full throttle (F) and full brake (B) marks sit on the path: from a full-throttle mark the car
+speeds up as hard as it can until it must brake for the next corner; from a full-brake mark it
+brakes as hard as it can. Straight (L) turns the selection into one straight line; the path
+leaves and joins it along it. Drag its end points to move it.
 
 Keys: a add at the cursor (for remote desktops), z undo, c closed loop / open path,
 r clear all (z brings them back), + / - zoom, 0 whole map, enter save, q quit.
 
-CSV format (same as the legacy race_stack): x,y,speed  in the map frame [m, m, m/s].
+CSV format (same as the legacy race_stack): x,y,speed  in the map frame [m, m, m/s], plus
+zone,mark columns when the route has full-throttle / full-brake marks. The editable points,
+straight lines and marks are kept beside it in <route>.edit.json.
 """
 import argparse
+import hashlib
+import json
 import os
 import signal
 import sys
@@ -35,9 +46,10 @@ from scipy import ndimage
 
 from waypoint_nav.map_editor import (BUTTON, KOREAN_FONTS, STYLE, ZOOM_STEP, _icon_lines,
                                      make_icon, zoomed)
-from waypoint_nav.path_tools import (curvature, distance_to_polyline, handles_from_path,
-                                     read_csv, smooth_path, smoothing_fit, speed_profile,
-                                     write_csv)
+from waypoint_nav.path_tools import (BOOST, BRAKE, SPACING, build_path, curvature,
+                                     distance_to_polyline, handles_from_path, left_normals,
+                                     race_profile, racing_line, read_csv, read_marks, smooth_path,
+                                     smoothing_fit, wall_margins, write_csv)
 
 WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
 LIMIT_DEFAULTS = {'alat': 2.0, 'alon': 3.0}   # used until a route is saved with other values
@@ -52,6 +64,10 @@ def settings():
 GRAB_POINT = 10     # screen pixels: a press this close grabs a point
 GRAB_PATH = 6       # screen pixels: a press this close to the path adds a point there
 DRAG_START = 3      # screen pixels: less movement than this is a click, not a drag
+SELECT_START = 8    # screen pixels: a press on empty map moved this far selects instead of adding
+GRAB_MARK = 30      # screen pixels: a full-throttle / full-brake mark lands on the path this close
+BOOST_COLOR, BRAKE_COLOR = '#2e7d32', '#c62828'   # the panel's go / E-STOP colours
+SEL_COLOR = '#1565c0'
 FREE_MIN = 250      # map pixels at least this bright are free space (254); walls 0, unknown 205
 SMOOTH_DEVIATION = 0.05  # [m] how far one smoothing click may move the path, halved until it fits
 SMOOTH_TRIES = 5         # halvings before giving up (0.05 m down to about 3 mm)
@@ -73,12 +89,21 @@ TEXT = {
            'speed_range': '속도 {v0:.2f}~{v1:.2f} m/s',
            'save': '저장', 'save_tip': '경로를 부드럽게 만들고 속도를 계산해 CSV와 미리보기 PNG로 저장',
            'quit': '종료', 'quit_tip': '저장 안 한 변경은 사라짐',
-           'help': '클릭: 점 추가   점 드래그: 이동   경로 드래그: 점 끼우기   '
-                   '오른쪽 클릭: 점 삭제   오른쪽 드래그: 이동   휠: 확대/축소',
+           'help': '클릭: 점 추가   점 드래그: 이동   경로 드래그: 점 끼우기   빈 곳 드래그: 구간 선택   '
+                   '오른쪽 클릭: 삭제   오른쪽 드래그: 이동   휠: 확대/축소',
            'closed': '닫힌 경로', 'open': '열린 경로', 'pts': '점 {n}개',
            'unsaved': '저장 안 된 변경 있음', 'need': '점이 {n}개 이상 필요해요',
            'same_spot': '두 점이 같은 자리에 있어 부드럽게 만들 수 없어요',
-           'saved': '저장됨: 점 {n}개, {m:.1f} m, 속도 {v0:.2f}~{v1:.2f} m/s'},
+           'saved': '저장됨: 점 {n}개, {m:.1f} m, 속도 {v0:.2f}~{v1:.2f} m/s',
+           'boost': '풀악셀 점', 'boost_tip': '누른 뒤 경로를 클릭. 여기부터 다음 코너 진입부까지 최대 가속',
+           'brake': '풀브레이크 점', 'brake_tip': '누른 뒤 경로를 클릭. 여기부터 다음 코너 속도까지 최대 감속',
+           'straight': '직선 구간', 'straight_tip': '드래그로 선택한 구간을 직선 하나로. 양 끝 점을 끌어 옮기고, 선을 오른쪽 클릭하면 직선 해제',
+           'race': '레이싱 라인', 'race_tip': '아웃-인-아웃: 벽 여유 안에서 곡률이 가장 작은 선으로. 선택 구간이 있으면 그 구간만, 없으면 전체',
+           'place': '경로를 클릭해서 {what} 놓기 (Esc 취소)', 'placed': '{what}: 최고 {v:.1f} m/s',
+           'sel': '선택: {m:.1f} m (Esc로 해제)', 'need_sel': '먼저 빈 곳을 드래그해서 구간을 선택하세요',
+           'straightened': '직선 {m:.1f} m', 'raced': '레이싱 라인: 최대 곡률 {k0:.2f} → {k1:.2f} 1/m, 커브 최저 속도 {v0:.2f} → {v1:.2f} m/s',
+           'race_none': '더 펼 수 없어요 (벽 여유 안에서 이미 최소 곡률)',
+           'scope_sel': '선택 구간에만 적용', 'scope_all': '경로 전체에 적용'},
     'en': {'undo': 'Undo', 'loop': 'Closed loop / open path',
            'loop_tip': 'closed: the last point joins the first, one lap',
            'clear': 'Clear all points', 'clear_tip': 'undo brings them back',
@@ -97,12 +122,21 @@ TEXT = {
            'speed_range': 'speed {v0:.2f}..{v1:.2f} m/s',
            'save': 'Save', 'save_tip': 'smooth the path, compute speeds, write CSV and preview PNG',
            'quit': 'Quit', 'quit_tip': 'unsaved changes are lost',
-           'help': 'click: add   drag point: move   drag path: insert   right click: remove   '
-                   'right drag: move view   wheel: zoom',
+           'help': 'click: add   drag point: move   drag path: insert   drag empty map: select   '
+                   'right click: remove   right drag: move view   wheel: zoom',
            'closed': 'closed loop', 'open': 'open path', 'pts': '{n} points',
            'unsaved': 'unsaved changes', 'need': 'need at least {n} points',
            'same_spot': 'cannot smooth: two points are on the same spot',
-           'saved': 'saved {n} pts, {m:.1f} m, v {v0:.2f}..{v1:.2f} m/s'},
+           'saved': 'saved {n} pts, {m:.1f} m, v {v0:.2f}..{v1:.2f} m/s',
+           'boost': 'Full throttle mark', 'boost_tip': 'then click the path: flat out from here to the next corner',
+           'brake': 'Full brake mark', 'brake_tip': 'then click the path: brake as hard as possible from here to the next corner speed',
+           'straight': 'Straight', 'straight_tip': 'turn the dragged selection into one straight line; drag its ends to move it, right click the line to undo it',
+           'race': 'Racing line', 'race_tip': 'out-in-out: least curvature within the wall margins; the selection only if there is one',
+           'place': 'click the path to place the {what} (Esc cancels)', 'placed': '{what}: top {v:.1f} m/s',
+           'sel': 'selected {m:.1f} m (Esc clears)', 'need_sel': 'drag on empty map first to select a part of the path',
+           'straightened': 'straight {m:.1f} m', 'raced': 'racing line: max curvature {k0:.2f} -> {k1:.2f} 1/m, slowest corner {v0:.2f} -> {v1:.2f} m/s',
+           'race_none': 'cannot straighten further (already least curvature within the margins)',
+           'scope_sel': 'applies to the selection', 'scope_all': 'applies to the whole path'},
 }
 
 
@@ -199,6 +233,38 @@ def _icon_lines_wp(name, p, QtCore, QtGui):
         for x0, y0, x1, y1 in ((5.5, 9.5, 7, 10.5), (12, 5, 12, 7), (18.5, 9.5, 17, 10.5)):
             p.drawLine(P(x0, y0), P(x1, y1))
         p.drawLine(P(12, 14), P(17, 8))
+    elif name == BOOST:         # flat green double chevron with a black edge
+        p.setBrush(QtGui.QColor(BOOST_COLOR))
+        for x in (2, 10):
+            p.drawPolygon(QtGui.QPolygonF([P(x, 4), P(x + 6, 4), P(x + 12, 12), P(x + 6, 20),
+                                           P(x, 20), P(x + 6, 12)]))
+    elif name == BRAKE:         # flat red octagon with a black edge and a white stop bar
+        p.setBrush(QtGui.QColor(BRAKE_COLOR))
+        p.drawPolygon(QtGui.QPolygonF([P(8, 2), P(16, 2), P(22, 8), P(22, 16), P(16, 22),
+                                       P(8, 22), P(2, 16), P(2, 8)]))
+        p.setBrush(QtGui.QColor('white'))
+        p.drawRect(R(6, 10, 12, 4))
+    elif name == 'straight':    # curve, straight line between two points, curve
+        path = QtGui.QPainterPath(P(2, 20))
+        path.cubicTo(P(3, 14), P(5, 12), P(7, 12))
+        p.drawPath(path)
+        p.drawLine(P(7, 12), P(17, 12))
+        path = QtGui.QPainterPath(P(17, 12))
+        path.cubicTo(P(19, 12), P(21, 10), P(22, 4))
+        p.drawPath(path)
+        p.setBrush(QtGui.QColor('black'))
+        for x in (7, 17):
+            p.drawEllipse(P(x, 12), 1.8, 1.8)
+    elif name == 'race':        # a corner's walls and the wide-in-wide line through it
+        p.drawLine(P(2, 22), P(2, 2))
+        p.drawLine(P(2, 2), P(22, 2))
+        p.drawLine(P(10, 22), P(10, 10))
+        p.drawLine(P(10, 10), P(22, 10))
+        path = QtGui.QPainterPath(P(4, 22))           # wide in, the inner corner, wide out
+        path.cubicTo(P(6, 9), P(9, 6), P(22, 4))
+        pen = QtGui.QPen(QtGui.QColor(BOOST_COLOR), 2.2)
+        p.setPen(pen)
+        p.drawPath(path)
     else:
         _icon_lines(name, p, QtCore, QtGui)
 
@@ -230,12 +296,18 @@ class Editor:
         self.dirty = False
         self.show_speed = False  # colour the path by the speed the CSV would store
         self.clearance = None    # [m] per map pixel, built on first use (see keep_off_walls)
+        self.straight = set()    # gaps i (point i to point i+1) that are straight lines
+        self.marks = []          # [BOOST or BRAKE, (x, y) on the path]
+        self.sel = None          # selected part of the path: its (start, middle, end) points
+        self.press = None        # (screen x, y, world point, moved) while left-dragging empty map
+        self.placing = None      # BOOST / BRAKE while waiting for a click on the path
+        self.mark_drag = None    # index of the mark held by the mouse
+        self._built = (None, None)   # (key, build_path result) for the current points
         families = set(QtGui.QFontDatabase().families())
         self.t = TEXT['ko' if families & set(KOREAN_FONTS) else 'en']
         out = os.path.join(WP_DIR, self.out_name)
         if os.path.exists(out):
-            handles, self.closed = handles_from_path(read_csv(out))
-            self.pts = [tuple(p) for p in handles]
+            self.load(out)
             print(f'opened {out}: {len(self.pts)} points', flush=True)
 
         # ---- map ----
@@ -249,6 +321,10 @@ class Editor:
         self.click_line, = self.ax.plot([], [], 'o', color='tab:blue', ms=7, mec='white', mew=0.8,
                                         zorder=4)
         self.path_line = None
+        self.sel_line, = self.ax.plot([], [], '-', color=SEL_COLOR, lw=10, alpha=0.3,
+                                      solid_capstyle='round', zorder=2)
+        self.box = None           # rectangle while dragging a selection
+        self.overlays = []        # zone lines, marks and their labels, redrawn every time
         for ev, cb in (('button_press_event', self.on_click), ('motion_notify_event', self.on_motion),
                        ('button_release_event', self.on_release), ('key_press_event', self.on_key),
                        ('scroll_event', self.on_scroll)):
@@ -284,6 +360,11 @@ class Editor:
         line()
         button('smooth', 'S', self.smooth, t['smooth_tip'])
         button('walls', 'W', self.keep_off_walls, t['walls_tip'].format(d=args.wall_clearance))
+        button('race', 'O', self.race_line, t['race_tip'])
+        button('straight', 'L', self.straighten, t['straight_tip'])
+        line()
+        button(BOOST, 'F', lambda: self.start_placing(BOOST), t['boost_tip']).setCheckable(True)
+        button(BRAKE, 'B', lambda: self.start_placing(BRAKE), t['brake_tip']).setCheckable(True)
         line()
         button('zoom_in', '+', lambda: self.zoom(1 / ZOOM_STEP))
         button('zoom_out', '-', lambda: self.zoom(ZOOM_STEP))
@@ -328,8 +409,10 @@ class Editor:
                 'R': self.act(self.clear), '+': lambda: self.zoom(1 / ZOOM_STEP),
                 '=': lambda: self.zoom(1 / ZOOM_STEP), '-': lambda: self.zoom(ZOOM_STEP),
                 '0': self.fit_view, 'V': self.toggle_speed, 'S': self.smooth,
-                'W': self.keep_off_walls, 'Return': self.save, 'Enter': self.save,
-                'Q': self.win.close, 'Escape': self.win.close}
+                'W': self.keep_off_walls, 'O': self.race_line, 'L': self.straighten,
+                'F': lambda: self.start_placing(BOOST), 'B': lambda: self.start_placing(BRAKE),
+                'Return': self.save, 'Enter': self.save,
+                'Q': self.win.close, 'Escape': self.escape}
         self.shortcuts = []
         for seq, slot in keys.items():
             sc = QtWidgets.QShortcut(QtGui.QKeySequence(seq), self.win)
@@ -351,7 +434,7 @@ class Editor:
 
     def clear(self):
         self.remember()
-        self.pts = []
+        self.pts, self.straight, self.marks, self.sel = [], set(), [], None
 
     def set_limit(self, name, value):
         setattr(self.args, name, value)
@@ -365,19 +448,40 @@ class Editor:
         self.buttons['speed'].setChecked(self.show_speed)
         self.redraw()
 
-    def speeds(self):
-        """(xy, speeds) as save() would write them, or None while there is no smooth path."""
+    def build(self):
+        """build_path of the current points (xy, length, gap), or None while there is none."""
         if len(self.pts) < (3 if self.closed else 2):
             return None
-        try:
-            xy, _ = smooth_path(self.pts, self.closed)
-        except (ValueError, TypeError):
+        key = (np.asarray(self.pts, dtype=float).tobytes(), self.closed, frozenset(self.straight))
+        if self._built[0] != key:
+            try:
+                built = build_path(self.pts, self.closed, self.straight)
+                if not np.isfinite(built[0]).all():
+                    built = None
+            except (ValueError, TypeError):   # e.g. two points on the same spot during a drag
+                built = None
+            self._built = (key, built)
+        return self._built[1]
+
+    def mark_indices(self, xy):
+        """(waypoint index, kind) of every full-throttle / full-brake mark on the path xy."""
+        return [(int(np.argmin(np.linalg.norm(xy - p, axis=1))), kind) for kind, p in self.marks]
+
+    def profile(self):
+        """(xy, speeds, zones) as save() would write them, or None while there is no smooth path."""
+        built = self.build()
+        if built is None:
             return None
-        if not np.isfinite(xy).all():
-            return None
-        a = self.args
-        return xy, speed_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon,
-                                 getattr(a, 'abrake', a.alon))
+        xy, a = built[0], self.args
+        v, zone = race_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon,
+                               getattr(a, 'abrake', a.alon), self.mark_indices(xy),
+                               getattr(a, 'aboost', 5.0), getattr(a, 'afull', 4.0))
+        return xy, v, zone
+
+    def speeds(self):
+        """(xy, speeds) as save() would write them, or None while there is no smooth path."""
+        prof = self.profile()
+        return None if prof is None else prof[:2]
 
     def zoom(self, factor, center=None):
         xl, yl = self.ax.get_xlim(), self.ax.get_ylim()
@@ -401,18 +505,99 @@ class Editor:
         if not self.pts:
             return np.empty((0, 2))
         straight = np.array(self.pts + self.pts[:1] if self.closed else self.pts)
-        if len(self.pts) < (3 if self.closed else 2):
+        built = self.build()
+        if built is None:
             return straight
-        try:
-            xy, _ = smooth_path(self.pts, self.closed)
-        except (ValueError, TypeError):   # e.g. two points on the same spot during a drag
-            return straight
-        if not np.isfinite(xy).all():
-            return straight
+        xy = built[0]
         return np.vstack([xy, xy[:1]]) if self.closed else xy
 
     def to_px(self, xy):
         return np.array([world_to_px(x, y, self.h, self.res, self.origin) for x, y in xy]).reshape(-1, 2)
+
+    def sel_indices(self, xy):
+        """Indices of the path xy inside the selection, in driving order, or None."""
+        if self.sel is None or len(xy) < 3:
+            return None
+        ia, im, ib = (int(np.argmin(np.linalg.norm(xy - np.asarray(p), axis=1))) for p in self.sel)
+        n = len(xy)
+        if not self.closed:
+            a, b = sorted((ia, ib))
+            return np.arange(a, b + 1)
+        fwd = np.arange(ia, ia + (ib - ia) % n + 1) % n
+        return fwd if np.isin(im, fwd) else np.arange(ib, ib + (ia - ib) % n + 1) % n
+
+    def select_box(self, w0, w1):
+        """Select the longest stretch of the path inside the box with corners w0, w1 (world)."""
+        built = self.build()
+        if built is None:
+            return self.redraw()
+        xy = built[0]
+        (x0, x1), (y0, y1) = sorted((w0[0], w1[0])), sorted((w0[1], w1[1]))
+        inside = (xy[:, 0] >= x0) & (xy[:, 0] <= x1) & (xy[:, 1] >= y0) & (xy[:, 1] <= y1)
+        runs = _runs_of(inside, self.closed)
+        run = max(runs, key=len) if runs else []
+        if len(run) < 3 or len(run) == len(xy):   # nothing, or all of it: the tools take it all
+            self.sel = None
+            return self.redraw()
+        self.sel = (tuple(xy[run[0]]), tuple(xy[run[len(run) // 2]]), tuple(xy[run[-1]]))
+        self.redraw()
+
+    def show_box(self, w0, w1):
+        from matplotlib.patches import Rectangle
+        (u0, v0), (u1, v1) = self.to_px([w0, w1])
+        if self.box is None:
+            self.box = Rectangle((0, 0), 0, 0, fill=False, ec=SEL_COLOR, ls='--', lw=1.5, zorder=6)
+            self.ax.add_patch(self.box)
+        self.box.set_bounds(min(u0, u1), min(v0, v1), abs(u1 - u0), abs(v1 - v0))
+        self.fig.canvas.draw_idle()
+
+    def draw_overlays(self, prof):
+        """Full-throttle zones as a thick rainbow line with a black edge, full-brake zones in red
+        and black stripes, the marks on top (a green arrow along the path, a red stop sign)."""
+        from matplotlib.collections import LineCollection
+        for o in self.overlays:
+            o.remove()
+        self.overlays = []
+        if prof is None:
+            return
+        xy, v, zone = prof
+        px = self.to_px(xy)
+        for kind in (BOOST, BRAKE):
+            for run in _runs_of(zone == kind, self.closed):
+                if len(run) < 2:
+                    continue
+                seg = px[run]
+                if kind == BOOST:
+                    edge, = self.ax.plot(seg[:, 0], seg[:, 1], '-', color='black', lw=9,
+                                         solid_capstyle='round', zorder=3.2)
+                    pieces = np.stack([seg[:-1], seg[1:]], axis=1)
+                    colors = matplotlib.colormaps['hsv'](np.linspace(0.0, 0.85, len(pieces)))
+                    rainbow = LineCollection(pieces, colors=colors, linewidths=6, zorder=3.3,
+                                             capstyle='round')
+                    self.ax.add_collection(rainbow)
+                    top = run[int(np.argmax(v[run]))]
+                    label = self.ax.annotate(f'{v[top]:.1f} m/s', px[top], xytext=(8, 8),
+                                             textcoords='offset points', fontsize=9,
+                                             fontweight='bold', zorder=7,
+                                             bbox={'boxstyle': 'round', 'fc': 'white', 'ec': 'black'})
+                    self.overlays += [edge, rainbow, label]
+                else:
+                    for k in range(0, len(run) - 1, 3):
+                        part = px[run[k:k + 4]]
+                        line, = self.ax.plot(part[:, 0], part[:, 1], '-', lw=7,
+                                             color=BRAKE_COLOR if k // 3 % 2 == 0 else 'black',
+                                             solid_capstyle='butt', zorder=3.2)
+                        self.overlays.append(line)
+        for j, kind in self.mark_indices(xy):
+            nxt = xy[(j + 1) % len(xy)] if self.closed or j + 1 < len(xy) else xy[j]
+            prv = xy[j - 1] if j > 0 or self.closed else xy[j]
+            d = nxt - prv
+            angle = np.degrees(np.arctan2(d[1], d[0]))
+            marker = (3, 0, angle - 90) if kind == BOOST else '8'
+            dot, = self.ax.plot([px[j, 0]], [px[j, 1]], marker=marker, ms=16,
+                                mfc=BOOST_COLOR if kind == BOOST else BRAKE_COLOR,
+                                mec='black', mew=1.5, zorder=5)
+            self.overlays.append(dot)
 
     def redraw(self, msg=''):
         px = self.to_px(self.pts)
@@ -423,15 +608,24 @@ class Editor:
         if self.path_line:
             self.path_line.remove()
             self.path_line = None
-        sp = self.speeds() if self.show_speed else None
-        if sp is not None:
-            xy, v = sp
+        prof = self.profile() if self.show_speed or self.marks else None
+        self.draw_overlays(prof)
+        if self.show_speed and prof is not None:
+            xy, v, _ = prof
             px = self.to_px(xy)
             a = self.args
             self.path_line = self.ax.scatter(px[:, 0], px[:, 1], c=v, cmap='turbo', s=8,
-                                             vmin=a.vmin, vmax=a.vmax, zorder=3)
+                                             vmin=a.vmin, vmax=max(a.vmax, v.max()), zorder=3)
             if not msg:
                 msg = t['speed_range'].format(v0=v.min(), v1=v.max(), vmax=a.vmax)
+        built = self.build()
+        idx = self.sel_indices(built[0]) if built is not None else None
+        if idx is not None:
+            sel = self.to_px(built[0][idx])
+            self.sel_line.set_data(sel[:, 0], sel[:, 1])
+            msg = msg or t['sel'].format(m=len(idx) * SPACING)
+        else:
+            self.sel_line.set_data([], [])
         parts = [f'{self.map_name}{" *" if self.dirty else ""}', t['pts'].format(n=len(self.pts)),
                  t['closed'] if self.closed else t['open'],
                  msg or (t['unsaved'] if self.dirty else '')]
@@ -439,20 +633,48 @@ class Editor:
         a = self.args
         self.status.setToolTip(f'vmax {a.vmax:.1f} m/s, vmin {a.vmin:.1f} m/s, '
                                f'lateral {a.alat:.2f}, speed-up {a.alon:.2f}, '
-                               f'slow-down {getattr(a, "abrake", a.alon):.2f} m/s²')
+                               f'slow-down {getattr(a, "abrake", a.alon):.2f}, '
+                               f'full throttle {getattr(a, "aboost", 5.0):.2f}, '
+                               f'full brake {getattr(a, "afull", 4.0):.2f} m/s²')
         self.win.setWindowTitle(f'waypoint editor — {self.out_name}{" *" if self.dirty else ""}')
         self.fig.canvas.draw_idle()
 
+    def snapshot(self):
+        return (list(self.pts), set(self.straight), [list(m) for m in self.marks], self.closed)
+
+    def restore(self, state):
+        pts, straight, marks, closed = state
+        self.pts, self.straight, self.closed = list(pts), set(straight), closed
+        self.marks = [list(m) for m in marks]
+
     def remember(self):
-        """Call before any change to the points: makes it undoable and clears the saved view."""
-        self.history.append(list(self.pts))
+        """Call before any change to the path: makes it undoable and clears the saved view."""
+        self.history.append(self.snapshot())
         self.dirty = True
 
     def undo(self):
         if self.history:
-            self.pts = self.history.pop()
+            self.restore(self.history.pop())
             self.dirty = True
-            self.drag = None
+            self.drag = self.mark_drag = None
+
+    def insert_point(self, i, p, keep_line=False):
+        """Insert point p at index i; a straight line it splits stays straight with keep_line."""
+        split = i - 1 in self.straight
+        self.straight = _shift_insert(self.straight, i)
+        if split and keep_line:
+            self.straight |= {i - 1, i}
+        self.pts.insert(i, tuple(p))
+
+    def delete_point(self, i):
+        self.straight = _shift_delete(self.straight, i, len(self.pts), self.closed)
+        del self.pts[i]
+
+    def rotate(self, k):
+        """Start a closed loop at point k (the path stays the same)."""
+        n = len(self.pts)
+        self.pts = self.pts[k:] + self.pts[:k]
+        self.straight = {(g - k) % n for g in self.straight}
 
     # ---------- mouse ----------
     def event_world(self, ev):
@@ -466,6 +688,29 @@ class Editor:
         d = np.linalg.norm(screen - (ev.x, ev.y), axis=1)
         return int(d.argmin()) if d.min() <= GRAB_POINT else None
 
+    def mark_at(self, ev):
+        """Index of the full-throttle / full-brake mark under the mouse, or None."""
+        if not self.marks:
+            return None
+        screen = self.ax.transData.transform(self.to_px([p for _, p in self.marks]))
+        d = np.linalg.norm(screen - (ev.x, ev.y), axis=1)
+        return int(d.argmin()) if d.min() <= GRAB_POINT + 4 else None
+
+    def path_index_at(self, ev, reach):
+        """(index on the built path, its gap) nearest the mouse within reach pixels, or None."""
+        built = self.build()
+        if built is None:
+            return None
+        screen = self.ax.transData.transform(self.to_px(built[0]))
+        d = np.linalg.norm(screen - (ev.x, ev.y), axis=1)
+        j = int(d.argmin())
+        return (j, int(built[2][j])) if d[j] <= reach else None
+
+    def straight_at(self, ev):
+        """The straight gap under the mouse, or None."""
+        hit = self.path_index_at(ev, GRAB_PATH)
+        return hit[1] if hit and hit[1] in self.straight else None
+
     def on_path(self, ev):
         if len(self.pts) < 2:
             return False
@@ -475,8 +720,11 @@ class Editor:
     def add_point(self, ev):
         if ev.inaxes != self.ax or ev.xdata is None:
             return
+        self.append_point(self.event_world(ev))
+
+    def append_point(self, p):
         self.remember()
-        self.pts.append(self.event_world(ev))
+        self.pts.append(tuple(p))
         x, y = self.pts[-1]
         print(f'point {len(self.pts)}: ({x:.2f}, {y:.2f}) m', flush=True)
 
@@ -489,17 +737,23 @@ class Editor:
             return
         if ev.button != 1:
             return
-        hit = self.point_at(ev)
-        if hit is not None:
+        if self.placing:
+            return self.place_mark(ev)
+        mark = self.mark_at(ev)
+        hit = self.point_at(ev) if mark is None else None
+        if mark is not None:
+            self.mark_drag, self.drag_from = mark, (ev.x, ev.y)
+        elif hit is not None:
             self.drag, self.drag_from = hit, (ev.x, ev.y)
-        elif self.on_path(ev):
+        elif self.on_path(ev) and self.straight_at(ev) is None:
             # the new point is held right away: it starts on the path and follows the mouse
             self.remember()
             self.drag = insert_index(self.pts, self.event_world(ev), self.closed)
-            self.pts.insert(self.drag, self.event_world(ev))
+            self.insert_point(self.drag, self.event_world(ev))
+            self.redraw()
         else:
-            self.add_point(ev)
-        self.redraw()
+            # empty map (or a straight line): a point on release, or a selection box if it moves
+            self.press = (ev.x, ev.y, self.event_world(ev), False)
 
     def on_motion(self, ev):
         if self.pan is not None:
@@ -514,14 +768,28 @@ class Editor:
             self.ax.set_ylim(yl[0] - dy, yl[1] - dy)
             self.fig.canvas.draw_idle()
             return
-        if self.drag is None or ev.inaxes != self.ax or ev.xdata is None:
+        if self.press is not None:
+            x0, y0, w0, moved = self.press
+            if not moved and np.hypot(ev.x - x0, ev.y - y0) < SELECT_START:
+                return
+            self.press = (x0, y0, w0, True)
+            if ev.inaxes == self.ax and ev.xdata is not None:
+                self.show_box(w0, self.event_world(ev))
+            return
+        if (self.drag is None and self.mark_drag is None) or ev.inaxes != self.ax or ev.xdata is None:
             return
         if self.drag_from is not None:
             if np.hypot(ev.x - self.drag_from[0], ev.y - self.drag_from[1]) < DRAG_START:
                 return
             self.drag_from = None
             self.remember()
-        self.pts[self.drag] = self.event_world(ev)
+        if self.mark_drag is not None:   # marks stay on the path: the nearest point of it
+            built = self.build()
+            if built is not None:
+                xy, w = built[0], np.asarray(self.event_world(ev))
+                self.marks[self.mark_drag][1] = tuple(xy[np.argmin(np.linalg.norm(xy - w, axis=1))])
+        else:
+            self.pts[self.drag] = self.event_world(ev)
         self.redraw()
 
     def on_release(self, ev):
@@ -529,16 +797,39 @@ class Editor:
             moved = self.pan[4]
             self.pan = None
             if not moved and ev.inaxes == self.ax:
-                hit = self.point_at(ev)
-                if hit is not None:
-                    self.remember()
-                    del self.pts[hit]
-                    self.redraw()
+                self.remove_at(ev)
             return
+        if self.press is not None:
+            _, _, w0, moved = self.press
+            self.press = None
+            if not moved:
+                self.append_point(w0)
+                return self.redraw()
+            if self.box is not None:
+                self.box.remove()
+                self.box = None
+            if ev.inaxes == self.ax and ev.xdata is not None:
+                return self.select_box(w0, self.event_world(ev))
+            return self.redraw()
         if self.drag is not None and self.drag_from is None:
             x, y = self.pts[self.drag]
             print(f'point {self.drag + 1}: moved to ({x:.2f}, {y:.2f}) m', flush=True)
-        self.drag = self.drag_from = None
+        self.drag = self.drag_from = self.mark_drag = None
+
+    def remove_at(self, ev):
+        """Right click: the point under the mouse, else the mark, else the straight line."""
+        hit, mark = self.point_at(ev), self.mark_at(ev)
+        line = self.straight_at(ev) if hit is None and mark is None else None
+        if hit is None and mark is None and line is None:
+            return
+        self.remember()
+        if hit is not None:
+            self.delete_point(hit)
+        elif mark is not None:
+            del self.marks[mark]
+        else:
+            self.straight.discard(line)
+        self.redraw()
 
     def on_scroll(self, ev):
         if ev.inaxes == self.ax and ev.xdata is not None:
@@ -558,10 +849,50 @@ class Editor:
         elif ev.key == 'enter':
             self.save()
             return
-        elif ev.key in ('q', 'escape'):
+        elif ev.key == 'escape':
+            return self.escape()
+        elif ev.key == 'q':
             self.win.close()
             return
         self.redraw()
+
+    def escape(self):
+        """Esc: stop placing a mark, else drop the selection, else close."""
+        if self.placing:
+            self.set_placing(None)
+        elif self.sel is not None:
+            self.sel = None
+        else:
+            return self.win.close()
+        self.redraw()
+
+    # ---------- marks ----------
+    def set_placing(self, kind):
+        self.placing = kind
+        for k in (BOOST, BRAKE):
+            self.buttons[k].setChecked(k == kind)
+
+    def start_placing(self, kind):
+        self.set_placing(None if self.placing == kind else kind)
+        self.redraw(self.t['place'].format(what=self.t[kind]) if self.placing else '')
+
+    def place_mark(self, ev):
+        t, kind = self.t, self.placing
+        hit = self.path_index_at(ev, GRAB_MARK)
+        if hit is None:
+            return self.redraw(t['place'].format(what=t[kind]))
+        self.remember()
+        xy = self.build()[0]
+        self.marks.append([kind, tuple(xy[hit[0]])])
+        self.set_placing(None)
+        _, v, zone = self.profile()
+        j, top = hit[0], 0.0
+        for k in range(len(xy)):     # the zone this mark starts
+            q = (j + k) % len(xy)
+            if k and (not zone[q] or q < j and not self.closed):
+                break
+            top = max(top, v[q])
+        self.redraw(t['placed'].format(what=t[kind], v=top))
 
     # ---------- path tools (each click is one undoable step) ----------
     def path_stats(self):
@@ -576,22 +907,172 @@ class Editor:
         u, v = world_to_px(*p, self.h, self.res, self.origin)
         return sample(self.clearance, u, v)
 
+    def clear_pts(self, pts):
+        """Wall distance [m] of Nx2 world points."""
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        u = (pts[:, 0] - self.origin[0]) / self.res - 0.5
+        v = self.h - (pts[:, 1] - self.origin[1]) / self.res - 0.5
+        return ndimage.map_coordinates(self.clearance, [v, u], order=1, mode='nearest')
+
     def path_clearance(self):
         """Clearance [m] of every point of the smoothed path."""
         return np.array([self.clearance_at(p) for p in self.curve()])
+
+    def need_clearance(self):
+        if self.clearance is None:
+            self.clearance = clearance_map(self.img, self.res)
+
+    def handle_near(self, p, tol):
+        if not self.pts:
+            return None
+        d = np.linalg.norm(np.asarray(self.pts, dtype=float) - np.asarray(p), axis=1)
+        return int(d.argmin()) if d.min() <= tol else None
+
+    def anchor_selection(self):
+        """Make both ends of the selection points of their own: (a, b) with the selection running
+        from point a forward to point b. A closed loop is turned so that a = 0. None: no part."""
+        built = self.build()
+        idx = self.sel_indices(built[0]) if built is not None else None
+        if idx is None or len(idx) < 3:
+            return None
+        ends = [built[0][idx[0]].copy(), built[0][idx[-1]].copy()]
+        for p in ends:
+            if self.handle_near(p, 0.15) is None:
+                built = self.build()
+                if built is None:
+                    return None
+                j = int(np.argmin(np.linalg.norm(built[0] - p, axis=1)))
+                self.insert_point(int(built[2][j]) + 1, p, keep_line=True)
+        a, b = (self.handle_near(p, 0.15) for p in ends)
+        if a is None or b is None or a == b:
+            return None
+        if self.closed:
+            self.rotate(a)
+            a, b = 0, (b - a) % len(self.pts)
+        elif a > b:
+            a, b = b, a
+        return a, b
+
+    def scope(self):
+        """Gap range [a, b) the tools change: the selection, else the whole path (a closed loop
+        turned so the range does not wrap). None: a whole closed loop without straight lines."""
+        if self.sel is not None:
+            ab = self.anchor_selection()
+            if ab is not None:
+                return ab
+        n = len(self.pts)
+        if not self.closed:
+            return 0, n - 1
+        if not self.straight:
+            return None
+        self.rotate((min(self.straight) + 1) % n)
+        return 0, n
+
+    def curve_runs(self, a, b):
+        """(s, e): stretches from point s to point e inside [a, b) without a straight line."""
+        runs, s, n = [], a, len(self.pts)
+        for g in range(a, b):
+            if g % n in self.straight:
+                if g > s:
+                    runs.append((s, g))
+                s = g + 1
+        if b > s:
+            runs.append((s, b))
+        return runs
+
+    def sub_path(self, s, e):
+        """The built path from point s to point e (an open piece), or None if too short."""
+        built = self.build()
+        if built is None:
+            return None
+        xy, _, gap = built
+        n = len(self.pts)
+        ids = np.where((gap >= s) & (gap < e))[0]
+        if len(ids) > 1:
+            jump = np.where(np.diff(ids) > 1)[0]
+            if len(jump):        # the stretch runs past the end of the array: put it in order
+                ids = np.concatenate([ids[jump[0] + 1:], ids[:jump[0] + 1]])
+        sub = np.vstack([self.pts[s], xy[ids], self.pts[e % n]])
+        keep = np.concatenate([[True], np.linalg.norm(np.diff(sub, axis=0), axis=1) > 0.3 * SPACING])
+        keep[-1] = True
+        sub = sub[keep]
+        if len(sub) > 2 and np.linalg.norm(sub[-1] - sub[-2]) < 0.3 * SPACING:
+            sub = np.delete(sub, -2, axis=0)
+        return sub if len(sub) >= 9 else None
+
+    def splice(self, s, e, inner):
+        """Replace the points between s and e with inner."""
+        shift = len(inner) - (e - s - 1)
+        self.straight = {g + shift if g >= e else g for g in self.straight if not s <= g < e}
+        self.pts = self.pts[:s + 1] + [tuple(p) for p in inner] + self.pts[e:]
+
+    def apply_runs(self, fn):
+        """fn(open piece) -> new piece with the same ends, or None, for every stretch of curve in
+        scope(). One undo step; the points change only if a stretch did. Returns how many."""
+        state, dirty = self.snapshot(), self.dirty
+        self.history.append(state)
+        changed = 0
+        sc = self.scope()
+        if sc is not None:
+            for s, e in reversed(self.curve_runs(*sc)):
+                sub = self.sub_path(s, e)
+                new = fn(sub) if sub is not None else None
+                if new is None:
+                    continue
+                inner = handles_from_path(np.asarray(new), closed=False)[0][1:-1]
+                self.splice(s, e, inner)
+                changed += 1
+        if not changed:
+            self.history.pop()
+            self.restore(state)
+            self.dirty = dirty
+        else:
+            self.dirty = True
+        return changed
 
     def smooth(self):
         """One click: refit the path with a smoothing spline, as much as walls and curvature allow.
 
         Accepted only if the sharpest curve gets gentler and no part of the path ends up closer to
         a wall than before (when it is inside the clearance target); otherwise the allowed change
-        is halved and tried again."""
+        is halved and tried again. With a selection or straight lines only the stretches of curve
+        in the selection (or between the lines) change, and their ends stay put."""
         t = self.t
         before = self.path_stats()
         if before is None:
             return self.redraw(t['need'].format(n=3 if self.closed else 2))
-        if self.clearance is None:
-            self.clearance = clearance_map(self.img, self.res)
+        self.need_clearance()
+        target = self.args.wall_clearance
+        if self.sel is None and not self.straight:
+            return self.smooth_whole(before)
+        ks = []
+
+        def ease(sub):
+            k0 = float(curvature(sub, False)[1:-1].max())
+            gap_old = self.clear_pts(sub)
+            deviation = SMOOTH_DEVIATION
+            for _ in range(SMOOTH_TRIES):
+                try:
+                    new = smoothing_fit(sub, False, deviation, pinned=3)
+                except (ValueError, TypeError):
+                    new = None
+                if new is not None and len(new) > 4 and np.isfinite(new).all():
+                    k1 = float(curvature(new, False)[1:-1].max())
+                    near = np.array([np.argmin(np.linalg.norm(sub - p, axis=1)) for p in new])
+                    if k1 < k0 - 1e-4 and (self.clear_pts(new)
+                                           >= np.minimum(target, gap_old[near]) - 0.01).all():
+                        ks.append((k0, k1))
+                        return new
+                deviation /= 2
+            return None
+        if not self.apply_runs(ease):
+            return self.redraw(t['smooth_none'])
+        after = self.path_stats() or before
+        self.redraw(t['smoothed'].format(k0=max(k for k, _ in ks), k1=max(k for _, k in ks),
+                                         v0=before[1], v1=after[1]))
+
+    def smooth_whole(self, before):
+        t = self.t
         target = self.args.wall_clearance
         cur = self.curve()
         cur = cur[:-1] if self.closed else cur
@@ -616,42 +1097,174 @@ class Editor:
             deviation /= 2
         self.redraw(t['smooth_none'])
 
+    def margins_fn(self, closed, base, xy0, v0):
+        """margins(xy) -> (left, right) wall distances for racing_line, from the speeds v0 the
+        current path xy0 is driven at (each new point takes the speed of the nearest old one)."""
+        a = self.args
+
+        def margins(xy):
+            near = np.array([np.argmin(np.linalg.norm(xy0 - p, axis=1)) for p in xy])
+            return wall_margins(xy, closed, v0[near], base, getattr(a, 'ld_min', 0.6),
+                                getattr(a, 'ld_gain', 0.4), getattr(a, 'slip', 0.03),
+                                getattr(a, 'margin_cap', 0.0))
+        return margins
+
+    def race_line(self):
+        """Out-in-out: the least-curvature line within the wall margins, for the selection if
+        there is one (its ends stay put), else the whole path."""
+        t = self.t
+        prof = self.profile()
+        if prof is None:
+            return self.redraw(t['need'].format(n=3 if self.closed else 2))
+        self.need_clearance()
+        before = self.path_stats()
+        xy0, v0, _ = prof
+        base = getattr(self.args, 'race_clearance', 0.25)
+        ks = []
+        if self.sel is None and self.closed and not self.straight:
+            new = racing_line(xy0, True, self.clear_pts, self.margins_fn(True, base, xy0, v0))
+            k0, k1 = curvature(xy0, True), curvature(new, True)
+            if not np.isfinite(new).all() or (k1 ** 2).sum() > 0.99 * (k0 ** 2).sum():
+                return self.redraw(t['race_none'])
+            self.remember()
+            self.pts = [tuple(p) for p in handles_from_path(new, True)[0]]
+            ks.append((k0.max(), k1.max()))
+        else:
+            def straighten_out(sub):
+                new = racing_line(sub, False, self.clear_pts, self.margins_fn(False, base, xy0, v0))
+                if len(new) < 5 or not np.isfinite(new).all():
+                    return None
+                k0, k1 = curvature(sub, False)[1:-1], curvature(new, False)[1:-1]
+                if (k1 ** 2).sum() > 0.99 * (k0 ** 2).sum():
+                    return None
+                ks.append((k0.max(), k1.max()))
+                return new
+            if not self.apply_runs(straighten_out):
+                return self.redraw(t['race_none'])
+        after = self.path_stats() or before
+        self.redraw(t['raced'].format(k0=max(k for k, _ in ks), k1=max(k for _, k in ks),
+                                      v0=before[1], v1=after[1]))
+
+    def straighten(self):
+        """The selection becomes one straight line between its end points."""
+        t = self.t
+        if self.sel is None:
+            return self.redraw(t['need_sel'])
+        state, dirty = self.snapshot(), self.dirty
+        self.history.append(state)
+        ab = self.anchor_selection()
+        if ab is None or self.closed and len(self.pts) - (ab[1] - ab[0] - 1) < 3:
+            self.history.pop()
+            self.restore(state)
+            self.dirty = dirty
+            return self.redraw(t['need_sel'])
+        a, b = ab
+        length = float(np.linalg.norm(np.subtract(self.pts[a], self.pts[b % len(self.pts)])))
+        self.splice(a, b, [])
+        self.straight.add(a)
+        self.sel = None
+        self.dirty = True
+        self.redraw(t['straightened'].format(m=length))
+
+    def wall_targets(self):
+        """Wall distance each point should keep: wall_clearance, plus with margin_cap the extra
+        a fast or tight stretch needs on the side of the nearest wall (see wall_margins)."""
+        a, base = self.args, self.args.wall_clearance
+        cap = getattr(a, 'margin_cap', 0.0)
+        prof = self.profile() if cap > 0 else None
+        if prof is None:
+            return [base] * len(self.pts)
+        xy, v, _ = prof
+        left, right = wall_margins(xy, self.closed, v, base, getattr(a, 'ld_min', 0.6),
+                                   getattr(a, 'ld_gain', 0.4), getattr(a, 'slip', 0.03), cap)
+        nrm = left_normals(xy, self.closed)
+        out = []
+        for p in self.pts:
+            j = int(np.argmin(np.linalg.norm(xy - np.asarray(p), axis=1)))
+            u, w = world_to_px(*p, self.h, self.res, self.origin)
+            # clearance grows away from the wall; image rows grow downwards
+            gx = sample(self.clearance, u + 1, w) - sample(self.clearance, u - 1, w)
+            gy = sample(self.clearance, u, w - 1) - sample(self.clearance, u, w + 1)
+            wall_left = -(gx * nrm[j, 0] + gy * nrm[j, 1]) > 0
+            out.append(float(left[j] if wall_left else right[j]))
+        return out
+
     def keep_off_walls(self):
         t = self.t
         if len(self.pts) < 2:
             return self.redraw(t['need'].format(n=2))
-        if self.clearance is None:
-            self.clearance = clearance_map(self.img, self.res)
-        target = self.args.wall_clearance
-        before = self.path_clearance().min()
-        if before >= target - 0.01:
+        self.need_clearance()
+        base = self.args.wall_clearance
+        targets = self.wall_targets()
+        built = self.build()
+        idx = self.sel_indices(built[0]) if built is not None else None
+        if idx is not None:          # only the points on the selection
+            on = set(idx.tolist())
+            near = [int(np.argmin(np.linalg.norm(built[0] - np.asarray(p), axis=1))) for p in self.pts]
+            inside = {i for i, j in enumerate(near) if j in on}
+        else:
+            inside = set(range(len(self.pts)))
+
+        def checked():
+            b = self.build()
+            if b is None:
+                return self.curve()
+            i = self.sel_indices(b[0])
+            return b[0] if i is None else b[0][i]
+        before = float(self.clear_pts(checked()).min())
+        low = [i for i in inside if self.clearance_at(self.pts[i]) < targets[i] - 0.01]
+        if before >= base - 0.01 and not low:
             return self.redraw(t['walled_none'].format(d=before))
         self.remember()
         moved, added = set(), 0
         for _ in range(WALL_PASSES):
-            for i, p in enumerate(self.pts):
-                if self.clearance_at(p) < target - 0.01:
+            for i in sorted(inside):
+                p = self.pts[i]
+                if self.clearance_at(p) < targets[i] - 0.01:
                     u, v = climb(self.clearance, *world_to_px(*p, self.h, self.res, self.origin),
-                                 target)
+                                 targets[i])
                     q = px_to_world(u, v, self.h, self.res, self.origin)
                     if np.hypot(q[0] - p[0], q[1] - p[1]) > 1e-6:
                         self.pts[i] = q
                         moved.add(i)
             # between the points the curve can still cut a corner: add a point at the worst spot
-            curve = self.curve()
-            gaps = np.array([self.clearance_at(p) for p in curve])
+            curve = checked()
+            gaps = self.clear_pts(curve)
             worst = int(gaps.argmin())
-            if gaps[worst] >= target - 0.02:
+            if gaps[worst] >= base - 0.02:
                 break
             w = curve[worst]
             if min(np.hypot(*(np.array(p) - w)) for p in self.pts) < 0.3:
                 break                       # the nearest point is already as far out as it gets
             i = insert_index(self.pts, w, self.closed)
-            self.pts.insert(i, tuple(w))
+            self.insert_point(i, w)
             moved = {j + (j >= i) for j in moved}
+            inside = {j + (j >= i) for j in inside} | {i}
+            targets.insert(i, base)
             added += 1
-        after = self.path_clearance().min()
+        after = float(self.clear_pts(checked()).min())
         self.redraw(t['walled'].format(d0=before, d1=after, m=len(moved), a=added))
+
+    # ---------- files ----------
+    def load(self, out):
+        """Open a saved route: the points, straight lines and marks from <route>.edit.json when it
+        belongs to this CSV, else points rebuilt from the CSV and its marks."""
+        xy = read_csv(out)
+        try:
+            with open(_edit_path(out)) as f:
+                kept = json.load(f)
+            if kept.get('csv_sha1') == _sha1(out):
+                self.pts = [tuple(map(float, p)) for p in kept['points']]
+                self.closed = bool(kept['closed'])
+                self.straight = {int(g) for g in kept['straight']}
+                self.marks = [[k, tuple(map(float, p))] for k, p in kept['marks'] if k in (BOOST, BRAKE)]
+                return
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if len(xy) >= 2:
+            handles, self.closed = handles_from_path(xy)
+            self.pts = [tuple(p) for p in handles]
+        self.marks = [[k, tuple(xy[i])] for i, k in read_marks(out) if k in (BOOST, BRAKE) and i < len(xy)]
 
     def save(self):
         t = self.t
@@ -660,19 +1273,24 @@ class Editor:
             self.redraw(t['need'].format(n=need))
             return
         a = self.args
-        try:
-            xy, length = smooth_path(self.pts, self.closed)
-        except (ValueError, TypeError):
+        built = self.build()
+        if built is None:
             self.redraw(t['same_spot'])
             return
-        if not np.isfinite(xy).all():
-            self.redraw(t['same_spot'])
-            return
-        v = speed_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon,
-                          getattr(a, 'abrake', a.alon))
+        xy, length, _ = built
+        _, v, zone = self.profile()
+        mark = [''] * len(xy)
+        for j, kind in self.mark_indices(xy):
+            mark[j] = kind
         os.makedirs(WP_DIR, exist_ok=True)
         out = os.path.join(WP_DIR, self.out_name)
-        write_csv(out, xy, v)
+        write_csv(out, xy, v, zone, mark)
+        n = len(self.pts)
+        with open(_edit_path(out), 'w') as f:
+            json.dump({'csv_sha1': _sha1(out), 'closed': self.closed,
+                       'points': [list(map(float, p)) for p in self.pts],
+                       'straight': sorted(g for g in self.straight if g < (n if self.closed else n - 1)),
+                       'marks': [[k, list(map(float, p))] for k, p in self.marks]}, f, indent=1)
         store = settings()
         for name in LIMIT_DEFAULTS:
             store.setValue(f'{self.out_name}/{name}', float(getattr(a, name)))
@@ -687,6 +1305,47 @@ class Editor:
         self.fig.savefig(out.replace('.csv', '.png'), dpi=120, bbox_inches='tight')
         print(f'saved {len(xy)} pts, {length:.1f} m -> {out}', flush=True)
         self.redraw(msg)
+
+
+def _edit_path(csv_path):
+    """<route>.edit.json beside <route>.csv: what the editor needs that the CSV does not keep."""
+    return (csv_path[:-4] if csv_path.endswith('.csv') else csv_path) + '.edit.json'
+
+
+def _sha1(path):
+    with open(path, 'rb') as f:
+        return hashlib.sha1(f.read()).hexdigest()
+
+
+def _runs_of(mask, closed):
+    """Index arrays of the stretches where mask is True, in order (a closed path wraps)."""
+    n = len(mask)
+    if not mask.any():
+        return []
+    if mask.all():
+        return [np.arange(n)]
+    start = int(np.argmin(mask)) if closed else 0    # a False index: no stretch wraps past it
+    runs, cur = [], []
+    for i in (np.arange(n) + start) % n:
+        if mask[i]:
+            cur.append(i)
+        elif cur:
+            runs.append(np.array(cur))
+            cur = []
+    if cur:
+        runs.append(np.array(cur))
+    return runs
+
+
+def _shift_insert(straight, i):
+    """Straight gaps after a point is inserted at index i (the gap it splits is no longer one)."""
+    return {g if g < i - 1 else g + 1 for g in straight if g != i - 1}
+
+
+def _shift_delete(straight, i, n, closed):
+    """Straight gaps after point i of n is removed (the two gaps beside it merge into a curve)."""
+    gone = {i, (i - 1) % n if closed else i - 1}
+    return {g - (g > i) for g in straight if g not in gone}
 
 
 def main():
@@ -707,6 +1366,20 @@ def main():
                    help='slow-down before corners [m/s^2]; keep below pure_pursuit stop_decel')
     p.add_argument('--wall_clearance', type=float, default=0.40,
                    help='keep-off-walls tool: path to wall distance [m] (half car width 0.21 + margin)')
+    p.add_argument('--aboost', type=float, default=5.0,
+                   help='speed-up from a full-throttle mark [m/s^2]')
+    p.add_argument('--afull', type=float, default=4.0,
+                   help='braking in full-throttle / full-brake zones [m/s^2]; at most what the '
+                        'tyres hold (pure_pursuit brake_decel)')
+    p.add_argument('--race_clearance', type=float, default=0.25,
+                   help='racing line: path to wall distance [m] (half car width 0.135 + margin)')
+    p.add_argument('--margin_cap', type=float, default=0.2,
+                   help='extra wall distance [m] at most for speed and curvature '
+                        '(corner cutting inside, sliding outside); 0 = off')
+    p.add_argument('--slip', type=float, default=0.03,
+                   help='outside extra per lateral acceleration [m per m/s^2]')
+    p.add_argument('--ld_min', type=float, default=0.6, help='pure_pursuit lookahead_min [m]')
+    p.add_argument('--ld_gain', type=float, default=0.4, help='pure_pursuit lookahead_gain [s]')
     args = p.parse_args(sys.argv[1:] if '--ros-args' not in sys.argv
                         else sys.argv[1:sys.argv.index('--ros-args')])
     editor = Editor(args.map_yaml, args.out, args)

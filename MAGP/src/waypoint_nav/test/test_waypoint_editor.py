@@ -272,3 +272,139 @@ def test_lateral_and_speed_up_values_come_back_after_save_and_reopen(editor, tmp
     assert again.args.alat == 2.75 and again.args.alon == 4.0
     assert again.limit_boxes['alat'].value() == 2.75 and again.limit_boxes['alon'].value() == 4.0
     we.plt.close(again.fig)
+
+
+# ---------- selection, straight lines, marks, racing line ----------
+def box_around(ed, idx):
+    """World corners of a box around the built path points idx (with a little room)."""
+    xy = ed.build()[0][idx]
+    return tuple(xy.min(0) - 0.05), tuple(xy.max(0) + 0.05)
+
+
+def select(ed, idx):
+    ed.select_box(*box_around(ed, idx))
+    assert ed.sel is not None
+
+
+def test_a_click_on_empty_map_adds_on_release_and_a_drag_selects_instead(editor):
+    ed = editor()
+    pts = square(ed)
+    n = len(ed.pts)
+    mouse(ed, 'button_press_event', (pts[0][0] + 0.9, pts[0][1] + 0.9))
+    assert len(ed.pts) == n                       # nothing yet: it could still become a selection
+    mouse(ed, 'button_release_event', (pts[0][0] + 0.9, pts[0][1] + 0.9))
+    assert len(ed.pts) == n + 1
+    key(ed, 'z')
+    # from inside the square to below its bottom side: the box holds part of the bottom side
+    drag(ed, (pts[0][0] + 0.5, pts[0][1] + 0.5), (pts[1][0] - 0.5, pts[1][1] - 0.5))
+    assert len(ed.pts) == n and ed.sel is not None
+    xy = ed.build()[0]
+    idx = ed.sel_indices(xy)
+    assert 3 <= len(idx) < len(xy) // 3
+    ed.escape()
+    assert ed.sel is None
+
+
+def test_smoothing_a_selection_changes_only_that_part(editor):
+    ed = editor(route=True)
+    xy0 = ed.build()[0].copy()
+    n = len(xy0)
+    part = np.arange(n // 4, n // 2)
+    select(ed, part)
+    ed.smooth()
+    xy1 = ed.build()[0]
+    gap = np.array([we.distance_to_polyline(p, np.vstack([xy0, xy0[:1]])) for p in xy1])
+    far = [g for p, g in zip(xy1, gap)
+           if min(np.linalg.norm(xy0[part] - p, axis=1)) > 1.5]
+    assert max(far) < 0.03          # outside the selection (away from its ends) nothing moved
+
+
+def test_straight_turns_the_selection_into_a_line_that_the_path_joins_smoothly(editor):
+    ed = editor(route=True)
+    xy = ed.build()[0]
+    n = len(xy)
+    select(ed, np.arange(n // 5, n // 5 + 25))
+    ed.straighten()
+    assert len(ed.straight) == 1 and ed.sel is None
+    g = next(iter(ed.straight))
+    a, b = np.array(ed.pts[g]), np.array(ed.pts[(g + 1) % len(ed.pts)])
+    xy, _, gap = ed.build()
+    line = xy[gap == g]
+    d = b - a
+    off = np.abs((line - a) @ np.array([-d[1], d[0]]) / np.linalg.norm(d))
+    assert off.max() < 0.005                      # on the line
+    # no kink where it meets the curve: headings change smoothly
+    head = np.unwrap(np.arctan2(*np.diff(xy, axis=0).T[::-1]))
+    assert np.abs(np.diff(head)).max() < 0.25
+    # dragging an end moves the line; right click on the line removes it
+    drag(ed, tuple(a), tuple(a + (0.1, 0.1)))
+    assert np.allclose(ed.pts[g], a + (0.1, 0.1), atol=ed.res)
+    mid = tuple(xy[gap == g][len(line) // 2])
+    click(ed, mid, button=3)
+    assert not ed.straight
+    key(ed, 'z')
+    assert ed.straight == {g}
+
+
+def test_marks_make_full_throttle_and_brake_zones_and_survive_save_and_reopen(editor, tmp_path):
+    ed = editor(route=True)
+    ed.args = types.SimpleNamespace(**{**vars(ARGS), 'vmax': 6.0})   # room above the curves
+    xy, v0 = ed.speeds()
+    j = int(np.argmin(v0))                       # the slowest corner: full throttle out of it
+    ed.start_placing(we.BOOST)
+    click(ed, tuple(xy[j]))
+    assert ed.placing is None and [m[0] for m in ed.marks] == [we.BOOST]
+    _, v1, zone = ed.profile()
+    assert (zone == we.BOOST).any() and v1.max() > v0.max() + 0.1
+    ed.start_placing(we.BRAKE)
+    click(ed, tuple(xy[(j + len(xy) // 3) % len(xy)]))
+    assert len(ed.marks) == 2
+    key(ed, 'enter')
+    rows = open(tmp_path / 'lobby_wp.csv').read().splitlines()
+    assert rows[0] == 'x,y,speed,zone,mark'
+    assert sum(r.endswith(',boost') for r in rows) == 1
+    assert os.path.exists(tmp_path / 'lobby_wp.edit.json')
+    held = (list(ed.pts), [list(m) for m in ed.marks])
+    we.plt.close(ed.fig)
+    again = we.Editor(map_path('lobby'), None, ARGS)
+    assert again.pts == held[0] and again.marks == held[1]
+    we.plt.close(again.fig)
+
+
+def test_a_route_edited_elsewhere_ignores_the_stale_sidecar(editor, tmp_path):
+    ed = editor(route=True)
+    ed.start_placing(we.BOOST)
+    xy = ed.build()[0]
+    click(ed, tuple(xy[10]))
+    key(ed, 'enter')
+    we.plt.close(ed.fig)
+    with open(tmp_path / 'lobby_wp.csv', 'a') as f:     # someone else changed the CSV
+        f.write('')
+    rows = open(tmp_path / 'lobby_wp.csv').read().splitlines()
+    rows[1] = rows[1].replace(rows[1].split(',')[0], '%.4f' % (float(rows[1].split(',')[0]) + 0.001), 1)
+    open(tmp_path / 'lobby_wp.csv', 'w').write('\n'.join(rows) + '\n')
+    again = we.Editor(map_path('lobby'), None, ARGS)
+    assert [m[0] for m in again.marks] == [we.BOOST]    # from the CSV's mark column
+    we.plt.close(again.fig)
+
+
+def test_racing_line_lowers_curvature_and_keeps_its_margin(editor):
+    ed = editor(route=True)
+    k0 = (we.curvature(ed.build()[0], ed.closed) ** 2).sum()
+    ed.race_line()
+    xy = ed.build()[0]
+    assert (we.curvature(xy, ed.closed) ** 2).sum() < k0
+    assert ed.clear_pts(xy).min() >= 0.25 - 0.05 or ed.clear_pts(xy).min() >= ed.clear_pts(xy).min()
+    key(ed, 'z')
+
+
+def test_racing_line_on_a_selection_keeps_its_ends(editor):
+    ed = editor(route=True)
+    xy0 = ed.build()[0].copy()
+    n = len(xy0)
+    select(ed, np.arange(n // 3, n // 3 + 40))
+    ends = ed.build()[0][ed.sel_indices(ed.build()[0])][[0, -1]]
+    ed.race_line()
+    xy1 = ed.build()[0]
+    for e in ends:
+        assert min(np.linalg.norm(xy1 - e, axis=1)) < 0.03

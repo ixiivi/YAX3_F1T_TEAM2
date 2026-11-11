@@ -91,3 +91,23 @@ def test_turn_speed_caps_full_lock_but_not_straight(bare_pp):
     assert 1.8 < full < 2.1
     assert bare_pp.turn_speed(0.0) == float('inf')
     assert bare_pp.turn_speed(0.05) > 4.0
+
+
+def test_full_throttle_and_full_brake_zones_change_only_the_ramp_rates(bare_pp, tmp_path):
+    from waypoint_nav.path_tools import write_csv
+    from waypoint_nav.pure_pursuit import load_zones
+    pp = bare_pp
+    params = {'boost_accel': 5.0, 'brake_decel': 4.0}
+    pp.gp = params.get
+    pp.speed_cmd = 2.0
+    assert pp.ramp(5.0) == pytest.approx(2.0 + 1.5 * pp.dt)
+    assert pp.ramp(5.0, 'boost') == pytest.approx(2.0 + 5.0 * pp.dt)
+    assert pp.ramp(1.0, 'brake') == pytest.approx(2.0 - 4.0 * pp.dt)
+    assert pp.ramp(1.0, 'boost') == pytest.approx(2.0 - 2.0 * pp.dt)
+    # a plain route has no zone column; a route with marks has one
+    xy = np.column_stack([np.arange(5.0), np.zeros(5)])
+    write_csv(tmp_path / 'a.csv', xy, np.ones(5))
+    assert list(load_zones(tmp_path / 'a.csv')) == [''] * 5
+    write_csv(tmp_path / 'b.csv', xy, np.ones(5), ['', 'boost', 'boost', 'brake', ''],
+              ['', 'boost', '', '', ''])
+    assert list(load_zones(tmp_path / 'b.csv')) == ['', 'boost', 'boost', 'brake', '']

@@ -74,6 +74,12 @@ def load_waypoints(path):
     return xy, v
 
 
+def load_zones(path):
+    """The editor's zone column: 'boost' / 'brake' where the car drives flat out, else ''."""
+    with open(os.path.expanduser(path)) as f:
+        return np.array([(r.get('zone') or '').strip() for r in csv.DictReader(f)], dtype=object)
+
+
 class PurePursuit(Node):
     def __init__(self):
         super().__init__('pure_pursuit')
@@ -104,6 +110,10 @@ class PurePursuit(Node):
         p('pose_timeout', 0.5)       # [s]
         p('accel', 3.5)              # [m/s^2] speed-up limit (the CSV's corner-exit speed-up is 3.0)
         p('stop_decel', 3.0)         # [m/s^2] motor-controlled slow-down for space / slower corners
+        # full-throttle / full-brake zones from the waypoint editor's marks (zone column)
+        p('boost_accel', 5.0)        # [m/s^2] speed-up in a full-throttle zone
+        p('brake_decel', 4.0)        # [m/s^2] slow-down in a full-brake zone
+        p('boost_max_speed', 0.0)    # [m/s] cap in those zones instead of max_speed; 0 = the CSV
         # target the CSV speed this far ahead [s of driving]: speeds up before the faster part
         # and honours any slower point within it early. Off by default: in a lap simulation
         # (2026-11-09) 0.3 s made every corner apex 0.3-0.4 m/s too fast for the CSV's lateral
@@ -229,13 +239,21 @@ class PurePursuit(Node):
         if not wp_file:
             raise SystemExit('waypoint_file parameter is required')
         self.xy, self.v_ref = load_waypoints(wp_file)
+        self.zone = load_zones(wp_file)
         self.closed = np.linalg.norm(self.xy[0] - self.xy[-1]) < 0.5
         csv_max = float(self.v_ref.max() * gp('speed_scale'))
         if gp('max_speed') > csv_max + 1e-6:
             self.get_logger().warn(
                 f'max_speed {gp("max_speed"):.2f} is above the CSV speeds (max {csv_max:.2f}); '
                 'the CSV wins. Regenerate the waypoints with a higher vmax or raise speed_scale.')
-        self.v_ref = np.minimum(self.v_ref * gp('speed_scale'), gp('max_speed'))
+        # the zones are where the route says flat out: max_speed (the panel's) does not cap them
+        flat_out = self.zone != ''
+        cap = np.where(flat_out, gp('boost_max_speed') or np.inf, gp('max_speed'))
+        self.v_ref = np.minimum(self.v_ref * gp('speed_scale'), cap)
+        if flat_out.any():
+            self.get_logger().info(
+                f'full-throttle / full-brake zones: {int(flat_out.sum())} waypoints, '
+                f'up to {self.v_ref[flat_out].max():.2f} m/s')
         self.get_logger().info(
             f'{len(self.xy)} waypoints from {wp_file}, '
             f'{"closed loop" if self.closed else "open path"}, '
@@ -887,11 +905,14 @@ class PurePursuit(Node):
         return bool((behind & (np.abs(p[:, 1]) < self.car_half_width + 0.1)).any())
 
     # ---------- speed ----------
-    def ramp(self, target):
+    def ramp(self, target, zone=''):
         """Next speed command. Never commands the cogging band below min_speed: starting
         jumps to min_speed, stopping slows down by motor speed control to min_speed and
-        then drops to 0 (brake)."""
+        then drops to 0 (brake). zone: the route's 'boost' / 'brake' zone at the car, where it
+        speeds up at boost_accel / slows down at brake_decel."""
         cur = self.speed_cmd
+        accel = self.gp('boost_accel') if zone == 'boost' else self.accel
+        decel = self.gp('brake_decel') if zone == 'brake' else self.stop_decel
         if target == 0.0:
             if cur <= self.min_speed + 1e-6:
                 return 0.0
@@ -899,8 +920,8 @@ class PurePursuit(Node):
         if cur < self.min_speed:
             return self.min_speed
         if target > cur:
-            return min(target, cur + self.accel * self.dt)
-        return max(target, cur - self.stop_decel * self.dt)
+            return min(target, cur + accel * self.dt)
+        return max(target, cur - decel * self.dt)
 
     def preview_speed(self, i):
         """CSV speed to aim for at waypoint i, looking speed_preview seconds ahead."""
@@ -1296,7 +1317,7 @@ class PurePursuit(Node):
         tx, ty = line[k]
         steer = self.clamp_steer(self.pursuit_steer(x, y, yaw, tx, ty))
 
-        v = self.ramp(v_ref if self.running else 0.0)
+        v = self.ramp(v_ref if self.running else 0.0, self.zone[i] if self.running else '')
         cap = self.turn_speed(steer)
         if returning:
             cap = min(cap, self.gp('return_speed'))
