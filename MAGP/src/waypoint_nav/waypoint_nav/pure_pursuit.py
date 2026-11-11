@@ -180,7 +180,16 @@ class PurePursuit(Node):
         p('lost_fit', 0.30)          # scan fraction on map walls below this ...
         p('lost_time', 1.0)          # ... for this long [s] = localization lost
         # bypassing shifts the car up to avoid_max_offset off the line, plus pose error in corners
-        p('off_path_limit', 1.5)     # [m] further than this from the path = localization lost
+        p('off_path_limit', 1.5)     # [m] further than this from the path = localization lost ...
+        p('return_fit', 0.5)         # ... unless the map fit is at least this: then the pose is
+                                     # right, the car really left the course: drive back to it
+        p('return_speed', 1.0)       # [m/s] speed while driving back to the course
+        # at speed the fit drops while the pose is right (2026-11-10 log: 0.14-0.19 at 3-4 m/s,
+        # stopped twice for nothing): faster than this and near the path, low fit is not lost
+        p('lost_speed', 2.0)         # [m/s]
+        # the speed the car can turn at with the steering it is about to use: at full lock and
+        # 2.95 m/s it slid 1.5 m off the course (2026-11-10). v <= sqrt(steer_alat * radius)
+        p('steer_alat', 4.0)         # [m/s^2] 0 = off
         p('resume_fit', 0.6)         # needed after relocalizing to drive on
         p('accept_fit', 0.75)        # a local re-search result is trusted from this fit on
         p('global_min_gain', 0.10)   # a far-away global result must fit this much better than the
@@ -689,6 +698,12 @@ class PurePursuit(Node):
         """Arc length from base_link the AEB checks at speed v: bumper + stopping distance."""
         v = max(v, 0.0)
         return self.car_front + self.aeb_base + v * self.aeb_delay + v * v / (2.0 * self.aeb_decel)
+
+    def turn_speed(self, steer):
+        """Fastest speed the car can take the turn of this steering at (steer_alat)."""
+        a = self.gp('steer_alat')
+        k = abs(math.tan(steer)) / self.wheelbase
+        return math.inf if a <= 0.0 or k < 1e-6 else math.sqrt(a / k)
 
     def escape_speed(self):
         """Speed for escapes into free space: faster while the pose is good (the steering it
@@ -1222,14 +1237,19 @@ class PurePursuit(Node):
             self.note_progress()
             self.apply_track(x, y, yaw)
             self.update_fit(x, y, yaw)
-            if self.low_since and time.monotonic() - self.low_since > self.gp('lost_time'):
+            fast_on_path = (self.speed_cmd > self.gp('lost_speed')
+                            and err < 0.5 * self.gp('off_path_limit'))
+            if (self.low_since and time.monotonic() - self.low_since > self.gp('lost_time')
+                    and not fast_on_path):
                 return self.start_recovery(f'맵과 {self.fit * 100:.0f}%만 맞음')
             # hit detection only exists to back out of a hit; with reversing off the car drives
             # exactly as before it was added (AEB and BLOCKED still stop it)
             hit = self.hit_reason(x, y, yaw) if self.gp('reverse_enabled') else None
             if hit:
                 return self.start_recovery(hit, hit=True)
-        if self.running and err > self.gp('off_path_limit'):
+        returning = (self.running and err > self.gp('off_path_limit') and self.fit is not None
+                     and self.fit >= self.gp('return_fit') and err < 3 * self.gp('off_path_limit'))
+        if self.running and err > self.gp('off_path_limit') and not returning:
             if self.recovery_on:
                 return self.start_recovery(f'경로에서 {err:.2f} m 벗어남')
             self.running = False
@@ -1277,6 +1297,11 @@ class PurePursuit(Node):
         steer = self.clamp_steer(self.pursuit_steer(x, y, yaw, tx, ty))
 
         v = self.ramp(v_ref if self.running else 0.0)
+        cap = self.turn_speed(steer)
+        if returning:
+            cap = min(cap, self.gp('return_speed'))
+        if v > cap:
+            v = max(cap, self.min_speed)     # straight away: the motor brakes to it
         # reach from the command about to be sent (with its steering floor): while slowing down
         # for a corner that is more than the target speed. From standstill the ramp jumps to
         # min_speed, so a stopped car keeps a real stopping distance and does not creep
@@ -1294,7 +1319,7 @@ class PurePursuit(Node):
             # the ramp state stays as is; only the command gets the steering-dependent floor
             v = self.floor(v, steer)
             self.record_trail()
-        mode = 'run' if self.running else 'stopping'
+        mode = ('return' if returning else 'run') if self.running else 'stopping'
         extra = f' off {self.offset:+.2f}' if abs(self.offset) > 0.01 else ''
         fit = f' fit {self.fit * 100:.0f}%' if self.fit is not None else ''
         fit += f' fix {self.corrections}' if self.corrections else ''

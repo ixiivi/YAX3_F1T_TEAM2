@@ -83,3 +83,11 @@ def test_escape_picks_the_free_steering_closest_to_the_wanted_one(bare_pp):
     alt = bare_pp.escape_steer(0.0, 0.42 + 0.3)
     assert alt is not None and alt > 0.0
     assert bare_pp.arc_obstacle(alt, 0.42 + 0.3) is None
+
+
+def test_turn_speed_caps_full_lock_but_not_straight(bare_pp):
+    bare_pp.gp = {'steer_alat': 4.0}.get
+    full = bare_pp.turn_speed(0.34)          # radius about 0.93 m
+    assert 1.8 < full < 2.1
+    assert bare_pp.turn_speed(0.0) == float('inf')
+    assert bare_pp.turn_speed(0.05) > 4.0
