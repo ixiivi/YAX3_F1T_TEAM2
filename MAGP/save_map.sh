@@ -2,6 +2,7 @@
 # Save the running slam_toolbox map to ~/MAGP/MAGP/maps/<name>.{pgm,yaml,posegraph,data}
 # usage: ~/MAGP/MAGP/save_map.sh [name]     (default name: map_MMDD_HHMM)
 set -e
+export ROS_LOCALHOST_ONLY=1   # ROS only inside the Jetson (same as ~/.bashrc)
 source /opt/ros/humble/setup.bash
 NAME=${1:-map_$(date +%m%d_%H%M)}
 DIR=$HOME/MAGP/MAGP/maps

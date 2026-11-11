@@ -823,7 +823,9 @@ class Panel(QtWidgets.QWidget):
     def edit_waypoints(self):
         if not self.selected_map():
             return self.warn('맵이 없어요.')
-        self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()}')
+        # the editor plans with this panel's max speed, so its speeds and brake points match the car
+        self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()} '
+                                   f'--vmax {self.vmax.value():.2f}')
         self.tabs.setCurrentWidget(self.procs['editor'].log)
 
     def delete_map(self):

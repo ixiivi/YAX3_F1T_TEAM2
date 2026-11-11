@@ -52,6 +52,11 @@ from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
+try:  # the VESC state is logged only; the planner runs without the driver package too
+    from vesc_msgs.msg import VescStateStamped
+except ImportError:  # pragma: no cover
+    VescStateStamped = None
+
 from waypoint_nav.global_localize import initial_pose_msg
 from waypoint_nav.path_tools import BOOST, BOOST_ACCEL, BRAKE, BRAKE_DECEL, STOP_DECEL
 from waypoint_nav.run_log import RunLog
@@ -200,7 +205,14 @@ class PurePursuit(Node):
         p('return_speed', 1.0)       # [m/s] speed while driving back to the course
         # at speed the fit drops while the pose is right (2026-11-10 log: 0.14-0.19 at 3-4 m/s,
         # stopped twice for nothing): faster than this and near the path, low fit is not lost
-        p('lost_speed', 2.0)         # [m/s]
+        p('lost_speed', 2.0)         # [m/s] (commanded or measured) ...
+        p('lost_yaw_rate', 40.0)     # [deg/s] ... or turning/drifting faster than this (IMU):
+                                     # in a drift the fit fell to 2% with the pose right (2026-11-11)
+        # the search lands where the car already was but the fit stays low: the pose was right,
+        # the surroundings differ from the map there. Drive on and ignore low fit for a while
+        p('same_pose_dist', 0.3)     # [m] ...
+        p('same_pose_yaw_deg', 15.0) # [deg]
+        p('changed_area_dist', 3.0)  # [m] driven before low fit counts again
         # the speed the car can turn at with the steering it is about to use: at full lock and
         # 2.95 m/s it slid 1.5 m off the course (2026-11-10). v <= sqrt(steer_alat * radius)
         p('steer_alat', 4.0)         # [m/s^2] 0 = off
@@ -306,8 +318,21 @@ class PurePursuit(Node):
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         # for the run log only: measured speed and accelerations, to compare with the plan
         self.odom_v = self.imu = None
+        self.search_guess = self.quiet_from = None
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
         self.create_subscription(Imu, '/sensors/imu/raw', self.on_imu, qos_profile_sensor_data)
+        # also for the log: where position jumps come from (AMCL, our drift fixes, TF age,
+        # CPU) and what the motor does (wheel spin at the start, braking)
+        self.amcl = None            # (receive time, xy std, yaw std)
+        self.create_subscription(PoseWithCovarianceStamped, '/amcl_pose', self.on_amcl, 10)
+        self.vesc = None            # (wheel speed m/s from erpm, motor A, duty, battery V)
+        p('erpm_gain', 4353.0)      # speed_to_erpm_gain in vesc.yaml, for the logged wheel speed
+        if VescStateStamped is not None:
+            self.create_subscription(VescStateStamped, '/sensors/core', self.on_vesc, 10)
+        self.pose_age = self.scan_age = self.loop_ms = None
+        self.no_pose_why = ''
+        self.last_fix = None        # (cm, deg) of the last drift fix, logged once
+        self.v_limit = ''
         # remote control (control panel): 'go', 'stop' (smooth), 'estop' (brake now)
         self.create_subscription(String, '/pure_pursuit/command', self.on_command, 10)
         self.status_pub = self.create_publisher(String, '/pure_pursuit/status', 10)
@@ -371,7 +396,7 @@ class PurePursuit(Node):
         self.events = []
         self.run_log = RunLog(gp('run_log_dir'), self.get_logger().warn)
         self.publish_path()
-        self.create_timer(1.0 / gp('rate'), self.step)
+        self.create_timer(1.0 / gp('rate'), self.timed_step)
         self.create_timer(0.2, lambda: self.status_pub.publish(String(data=self.status)))
         self.create_timer(1.0 / gp('run_log_rate'), self.log_row)
 
@@ -405,6 +430,23 @@ class PurePursuit(Node):
         self.event_pub.publish(String(data=text))
         self.events.append(text)
 
+    def on_amcl(self, msg):
+        c = msg.pose.covariance
+        self.amcl = (time.monotonic(), math.sqrt(max(c[0], 0.0) + max(c[7], 0.0)),
+                     math.degrees(math.sqrt(max(c[35], 0.0))))
+
+    def on_vesc(self, msg):
+        st = msg.state
+        self.vesc = (st.speed / self.gp('erpm_gain'), st.current_motor, st.duty_cycle,
+                     st.voltage_input)
+
+    def timed_step(self):
+        t0 = time.perf_counter()
+        try:
+            self.step()
+        finally:
+            self.loop_ms = (time.perf_counter() - t0) * 1000.0
+
     def on_odom(self, msg):
         self.odom_v = msg.twist.twist.linear.x
 
@@ -436,10 +478,37 @@ class PurePursuit(Node):
             'n_contact_front': len(self.contact_front),
             'scan_change': _num(self.scan_change),
             'frozen_s': _num(time.monotonic() - self.frozen_since),
+            **self.debug_cols(),
             'event': ' / '.join(self.events)})
         self.events = []
         if path:
             self.get_logger().info(f'run log: {path}')
+
+    def debug_cols(self):
+        """Columns for finding position jumps and wheel spin (see run_log.py)."""
+        odom = self.lookup('odom')
+        try:
+            mo = self.tf_buffer.lookup_transform('map', 'odom', Time())
+            mo_t = mo.transform
+            m_o = (mo_t.translation.x, mo_t.translation.y, yaw_from_quat(mo_t.rotation))
+        except TransformException:
+            m_o = None
+        now = time.monotonic()
+        fix, self.last_fix = self.last_fix, None
+        a, v = self.amcl, self.vesc
+        return {
+            'pose_age': _num(self.pose_age), 'no_pose_why': self.no_pose_why,
+            'odom_x': _num(odom[0]) if odom else '', 'odom_y': _num(odom[1]) if odom else '',
+            'odom_yaw': _num(odom[2]) if odom else '',
+            'map_odom_x': _num(m_o[0]) if m_o else '', 'map_odom_y': _num(m_o[1]) if m_o else '',
+            'map_odom_yaw': _num(m_o[2]) if m_o else '',
+            'amcl_age': _num(now - a[0]) if a else '', 'amcl_std': _num(a[1]) if a else '',
+            'amcl_std_deg': _num(a[2]) if a else '',
+            'fix_cm': _num(fix[0]) if fix else '', 'fix_deg': _num(fix[1]) if fix else '',
+            'loop_ms': _num(self.loop_ms), 'scan_age': _num(self.scan_age),
+            'v_wheel': _num(v[0]) if v else '', 'motor_a': _num(v[1]) if v else '',
+            'duty': _num(v[2]) if v else '', 'batt_v': _num(v[3]) if v else '',
+            'v_limit': self.v_limit}
 
     def publish_path(self):
         msg = Path()
@@ -454,6 +523,7 @@ class PurePursuit(Node):
 
     def on_scan(self, scan):
         self.scan = scan
+        self.scan_age = (self.get_clock().now() - Time.from_msg(scan.header.stamp)).nanoseconds * 1e-9
         r = np.asarray(scan.ranges)
         ang = scan.angle_min + np.arange(len(r)) * scan.angle_increment
         ok = np.isfinite(r) & (r > scan.range_min) & (r < 5.0)
@@ -499,14 +569,23 @@ class PurePursuit(Node):
 
     def lookup(self, parent, stamp=None):
         """Pose of base_link in `parent`: latest, or at `stamp` (e.g. the scan time)."""
+        main = parent == 'map' and stamp is None
         try:
             t = self.tf_buffer.lookup_transform(parent, 'base_link', stamp or Time())
-        except TransformException:
+        except TransformException as e:
+            if main:
+                self.no_pose_why = f'no tf: {str(e)[:60]}'
             return None
         if stamp is None:
             age = (self.get_clock().now() - Time.from_msg(t.header.stamp)).nanoseconds * 1e-9
+            if main:
+                self.pose_age = age
             if age > self.pose_timeout:
+                if main:
+                    self.no_pose_why = f'old {age:.2f} s'
                 return None
+        if main:
+            self.no_pose_why = ''
         tr = t.transform
         return tr.translation.x, tr.translation.y, yaw_from_quat(tr.rotation)
 
@@ -523,6 +602,7 @@ class PurePursuit(Node):
         """Hard stop now: speed 0, which ackermann_to_vesc turns into brake current."""
         self.speed_cmd = 0.0
         self.status = why
+        self.v_limit = why.split(' ')[0].rstrip(':')
         self.drive(0.0, 0.0)
 
     # ---------- geometry ----------
@@ -730,8 +810,10 @@ class PurePursuit(Node):
         return self.clamp_steer(math.atan2(2.0 * self.wheelbase * math.sin(aim), 1.0))
 
     def aeb_reach(self, v):
-        """Arc length from base_link the AEB checks at speed v: bumper + stopping distance."""
-        v = max(v, 0.0)
+        """Arc length from base_link the AEB checks at speed v: bumper + stopping distance.
+        The measured speed counts too: after an escape cut the command to 0.7 m/s the car still
+        rolled at 2-3 m/s, the reach shrank to 16 cm and it hit a cone (2026-11-11)."""
+        v = max(v, getattr(self, 'odom_v', None) or 0.0, 0.0)
         return self.car_front + self.aeb_base + v * self.aeb_delay + v * v / (2.0 * self.aeb_decel)
 
     def turn_speed(self, steer, zone=''):
@@ -769,6 +851,7 @@ class PurePursuit(Node):
             if alt is not None:
                 self.speed_cmd = min(self.speed_cmd, v_esc) if self.speed_cmd > v_esc else self.ramp(v_esc)
                 v = self.floor(self.speed_cmd, alt)
+                self.v_limit = 'escape'
                 self.status = (f'AEB escape: st {alt:+.2f} instead of {steer:+.2f} '
                                f'(blocked {hit - self.car_front:.2f} m ahead)')
                 self.drive(v, alt)
@@ -776,28 +859,33 @@ class PurePursuit(Node):
                 return
         self.aeb_since = self.aeb_since or now
         self.aeb_last = now
-        odom = self.lookup('odom')
-        if (self.gp('reverse_enabled') and odom is not None
-                and now - self.aeb_since >= self.gp('aeb_backoff_after')
-                and self.backoffs < self.gp('aeb_backoff_max')
-                and self.on_wall(self.aeb_hit_pts, x, y, yaw) >= self.gp('contact_points')):
-            self.backoffs += 1
+        if (now - self.aeb_since >= self.gp('aeb_backoff_after')
+                and self.on_wall(self.aeb_hit_pts, x, y, yaw) >= self.gp('contact_points')
+                and self.start_backoff(steer, f'벽 앞에서 AEB {self.gp("aeb_backoff_after"):.1f}초 정지')):
             self.aeb_since = None
-            self.backoff_at = odom
-            # backing up with the wheels turned away from the route swings the nose towards it
-            self.rev_steer_override = (-math.copysign(self.max_steer, steer)
-                                       if abs(steer) > 0.02 else 0.0)
-            self.rev_dist_override = self.gp('aeb_backoff_dist')
-            self.rev_want_steer = steer
-            self.skip_search, self.rev_blind = True, True
-            self.mode = 'reverse'
-            self.rev_start, self.rev_t0, self.rev_last = None, now, odom
-            self.event(f'벽 앞에서 AEB {self.gp("aeb_backoff_after"):.1f}초 정지 → '
-                       f'앞길이 열릴 때까지 후진 ({self.rev_dist_override * 100:.0f}~'
-                       f'{self.gp("aeb_backoff_max_dist") * 100:.0f} cm), 조향 {self.rev_steer_override:+.2f} '
-                       f'({self.backoffs}/{self.gp("aeb_backoff_max")})')
             return
         return self.stop(f'AEB obstacle {hit - self.car_front:.2f} m ahead of bumper')
+
+    def start_backoff(self, steer, why):
+        """Back up until a forward way is free (aeb_backoff_dist..aeb_backoff_max_dist), wheels
+        turned against `steer` so the nose swings towards it. False if it may not (reversing
+        off, no odometry, aeb_backoff_max back-offs in a row already)."""
+        odom = self.lookup('odom')
+        if (not self.gp('reverse_enabled') or odom is None
+                or self.backoffs >= self.gp('aeb_backoff_max')):
+            return False
+        self.backoffs += 1
+        self.backoff_at = odom
+        self.rev_steer_override = -math.copysign(self.max_steer, steer) if abs(steer) > 0.02 else 0.0
+        self.rev_dist_override = self.gp('aeb_backoff_dist')
+        self.rev_want_steer = steer
+        self.skip_search, self.rev_blind = True, True
+        self.mode = 'reverse'
+        self.rev_start, self.rev_t0, self.rev_last = None, time.monotonic(), odom
+        self.event(f'{why} → 앞길이 열릴 때까지 후진 ({self.rev_dist_override * 100:.0f}~'
+                   f'{self.gp("aeb_backoff_max_dist") * 100:.0f} cm), 조향 {self.rev_steer_override:+.2f} '
+                   f'({self.backoffs}/{self.gp("aeb_backoff_max")})')
+        return True
 
     def trail_or_escape(self, i, x, y, yaw, v_ref, now):
         """No shift is free: drive the current line behind the obstacle, keeping trail_gap;
@@ -815,6 +903,10 @@ class PurePursuit(Node):
                     self.record_trail()
                     return
             self.ftg_until = 0.0
+            # no free gap from here (2026-11-11: 28 s against a wall, FTG every 1.5 s): back up
+            # until a way forward opens, turning towards the widest gap if there is one
+            if self.start_backoff(steer if steer is not None else 0.0, '장애물 앞에 빈 틈이 없음'):
+                return self.stop('reverse: no gap ahead')
         gap = self.trail_gap_ahead(i, x, y)
         v = v_ref if gap is None else max(0.0, min(v_ref, self.gp('trail_gain') * (gap - self.gp('trail_gap'))))
         if v < self.min_speed * 0.5:
@@ -1005,6 +1097,7 @@ class PurePursuit(Node):
         msg.pose.covariance[35] = 0.005
         self.pose_pub.publish(msg)
         self.corrections += 1
+        self.last_fix = (math.hypot(bx - sx, by - sy) * 100.0, math.degrees(dyaw))
         self.low_since = None
         self.last_fit_t = time.monotonic() + 0.3   # give AMCL a moment before judging again
         self.get_logger().info(
@@ -1202,6 +1295,7 @@ class PurePursuit(Node):
             self.searching = True
             scan = self.scan
             guess = pose
+            self.search_guess = guess
             threading.Thread(target=self._search, args=(scan, guess), daemon=True).start()
             self.status = 'relocalizing...'
             return
@@ -1209,6 +1303,11 @@ class PurePursuit(Node):
             return
         fit, x, y, yaw = self.search_result
         self.search_result, self.searching = None, False
+        if fit < self.gp('resume_fit') and self.same_pose(self.search_guess, (x, y, yaw)):
+            self.event(f'위치는 그대로 맞음 (맵과 {fit * 100:.0f}%, 주변이 맵과 다른 구간) → 재출발')
+            self.quiet_from = self.lookup('odom')
+            self.recovered_at = self.quiet_from
+            return self.go()
         if fit < self.gp('resume_fit'):
             return self.start_recovery(f'맞는 위치를 못 찾았어요 (맞음 {fit * 100:.0f}%)')
         for _ in range(2):
@@ -1247,6 +1346,26 @@ class PurePursuit(Node):
                 f'{math.degrees(dyaw):+.1f} deg from the estimate, fit {fit * 100:.0f}%')
         self.search_result = (fit,) + tuple(res[1:])
 
+    def same_pose(self, a, b):
+        """Two poses (x, y, yaw) are the same place for relocalization."""
+        if a is None or b is None:
+            return False
+        dyaw = abs(math.atan2(math.sin(a[2] - b[2]), math.cos(a[2] - b[2])))
+        return (math.hypot(a[0] - b[0], a[1] - b[1]) < self.gp('same_pose_dist')
+                and math.degrees(dyaw) < self.gp('same_pose_yaw_deg'))
+
+    def changed_area(self):
+        """Still within changed_area_dist of where the pose was confirmed despite a low fit."""
+        if self.quiet_from is None:
+            return False
+        odom = self.lookup('odom')
+        if odom is None:
+            return False
+        if math.hypot(odom[0] - self.quiet_from[0], odom[1] - self.quiet_from[1]) < self.gp('changed_area_dist'):
+            return True
+        self.quiet_from = None
+        return False
+
     def step_verify(self, pose):
         self.drive(0.0, 0.0)
         if time.monotonic() < self.verify_at or pose is None:
@@ -1282,10 +1401,14 @@ class PurePursuit(Node):
             self.note_progress()
             self.apply_track(x, y, yaw)
             self.update_fit(x, y, yaw)
-            fast_on_path = (self.speed_cmd > self.gp('lost_speed')
-                            and err < 0.5 * self.gp('off_path_limit'))
-            if (self.low_since and time.monotonic() - self.low_since > self.gp('lost_time')
-                    and not fast_on_path):
+            v_now = max(self.speed_cmd, self.odom_v or 0.0)
+            dynamic = (v_now > self.gp('lost_speed')
+                       or (self.imu is not None and abs(self.imu[2]) > self.gp('lost_yaw_rate')))
+            if dynamic and err < 0.5 * self.gp('off_path_limit'):
+                self.low_since = None        # judge the fit again from when the car is calm
+            if self.changed_area():
+                self.low_since = None
+            if self.low_since and time.monotonic() - self.low_since > self.gp('lost_time'):
                 return self.start_recovery(f'맵과 {self.fit * 100:.0f}%만 맞음')
             # hit detection only exists to back out of a hit; with reversing off the car drives
             # exactly as before it was added (AEB and BLOCKED still stop it)
@@ -1346,8 +1469,12 @@ class PurePursuit(Node):
         cap = self.turn_speed(steer, zone)
         if returning:
             cap = min(cap, self.gp('return_speed'))
+        # what set the speed, for the log: following the CSV, still speeding up or slowing down
+        state = 'accel' if v < v_ref - 1e-6 else 'decel' if v > v_ref + 1e-6 else 'csv'
+        self.v_limit = state + (f':{zone}' if zone else '')
         if v > cap:
             v = max(cap, self.min_speed)     # straight away: the motor brakes to it
+            self.v_limit = 'return' if returning and cap <= self.gp('return_speed') else 'turn'
         # reach from the command about to be sent (with its steering floor): while slowing down
         # for a corner that is more than the target speed. From standstill the ramp jumps to
         # min_speed, so a stopped car keeps a real stopping distance and does not creep
