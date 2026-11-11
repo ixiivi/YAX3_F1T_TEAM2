@@ -6,9 +6,11 @@ output goes to a log tab and to logs/latest/<program>.log. Manual driving and E-
 so they override autonomous /drive commands at any time.
 """
 import glob
+import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -43,6 +45,13 @@ DRIVE_ROW_H = 48     # [px] height of the keyboard / gamepad / E-STOP row
 DRIVE_ICON_W = 56    # [px] width of the keyboard and gamepad buttons
 TAB_FONT_SCALE = 0.85   # log tab titles, a little smaller than the rest of the panel
 STATUS_CARD = 'padding:2px 6px; border-radius:4px; color:white;'
+DOT_OFF = '#9e9e9e'
+REMOTE_PID = '/tmp/f1t_panel_server.pid'   # written by panel_server.py while the Mac panel drives
+HANDOFF = '/tmp/f1t_panel_handoff.json'    # running programs passed between this panel and the server
+ESTOP_REQ = '/tmp/f1t_panel_estop_request'  # E-STOP pressed here while inactive: 'on' / 'off' for the server
+ESTOP_STATE = '/tmp/f1t_panel_estop_state'  # the server's E-STOP, shown here while inactive
+TAKEOVER_REQ = '/tmp/f1t_panel_takeover_request'  # "제어 가져오기": the server disconnects the Mac and hands over
+PAD_REQ = '/tmp/f1t_panel_pad_command'      # pad command (RB + button x3) the server read while this panel drives
 ERPM_GAIN = 4353.0   # speed_to_erpm_gain in vesc.yaml
 REST_CURRENT = 1.0   # [A] above this the voltage sags, so the charge estimate is held
 # resting LiPo voltage per cell -> state of charge [%]
@@ -73,6 +82,55 @@ def waypoint_problem(map_name, wp_path):
     if points < 2:
         return f'{name} 이(가) 비어 있어요. "웨이포인트 편집"으로 다시 만드세요.'
     return None
+
+
+def remote_server_running():
+    """panel_server.py (the Mac panel's server) is up: it owns /teleop and the programs."""
+    try:
+        with open(REMOTE_PID) as f:
+            os.kill(int(f.read()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def group_alive(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def read_handoff():
+    """Programs panel_server.py left running when the Mac disconnected, or None."""
+    try:
+        with open(HANDOFF) as f:
+            h = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if h.get('from') != 'server':
+        return None
+    try:
+        os.remove(HANDOFF)
+    except OSError:
+        pass
+    return h
+
+
+def map_files(map_yaml):
+    """Files to move when a map is deleted: (map files, its waypoint files). A map whose name
+    starts with this one keeps its own: deleting 1108 leaves 1108실험실.* and 1108_x_wp.csv."""
+    stem = os.path.basename(map_yaml)[:-5]
+    mine = sorted(p for p in glob.glob(f'{MAPS}/*') if os.path.isfile(p) and (
+        os.path.basename(p).startswith(stem + '.') or os.path.basename(p) == f'{stem}_orig.pgm'))
+    stems = [os.path.basename(y)[:-5] for y in glob.glob(f'{MAPS}/*.yaml')]
+    wps = []
+    for p in sorted(glob.glob(f'{WPS}/{glob.escape(stem)}_*')):
+        name = os.path.basename(p)
+        if max((m for m in stems if name.startswith(m + '_')), key=len, default=None) == stem:
+            wps.append(p)
+    return mine, wps
 
 
 def battery_percent(volts, cells):
@@ -153,13 +211,36 @@ class Proc(QtCore.QObject):
         self.name, self.log = name, log
         self.file = LogFile(key)
         self.p = None
+        self.adopted = None   # process group panel_server.py started and handed over
+        self.stopping = False  # SIGINT sent, not exited yet: its button shows "(끄는 중)"
+        self.out = None       # its output file, handed back so the server can keep showing it
+
+    def own(self):
+        return self.p is not None and self.p.state() != QtCore.QProcess.NotRunning
 
     def running(self):
-        return self.p is not None and self.p.state() != QtCore.QProcess.NotRunning
+        if self.own():
+            return True
+        if self.adopted is not None and not group_alive(self.adopted):
+            self.adopted = None
+        return self.adopted is not None
+
+    def pgid(self):
+        if self.own():
+            return int(self.p.processId())   # setsid: the group id is the leader's pid
+        return self.adopted if self.running() else None
+
+    def adopt(self, pgid, out=None):
+        if not self.running() and group_alive(pgid):
+            self.adopted, self.out = pgid, out
+            self.log.appendPlainText(f'[맥 제어판에서 켠 {self.name} 넘겨받음, pgid {pgid}. '
+                                     '로그는 서버 쪽에 있어요]\n')
 
     def start(self, cmd):
         if self.running():
             return
+        self.adopted = self.out = None
+        self.stopping = False
         self.p = QtCore.QProcess(self)
         self.p.setProcessChannelMode(QtCore.QProcess.MergedChannels)
         env = QtCore.QProcessEnvironment.systemEnvironment()
@@ -175,9 +256,11 @@ class Proc(QtCore.QObject):
         self.changed.emit()
 
     def stop(self):
-        if not self.running():
+        pid = self.pgid()
+        if pid is None:
             return
-        pid = int(self.p.processId())
+        self.stopping = True
+        self.changed.emit()
         try:
             os.killpg(pid, signal.SIGINT)   # like Ctrl+C: launch shuts its nodes down cleanly
         except ProcessLookupError:
@@ -187,7 +270,7 @@ class Proc(QtCore.QObject):
         QtCore.QTimer.singleShot(12000, lambda: self._kill(pid, signal.SIGKILL))
 
     def _kill(self, pid, sig):
-        if self.running() and int(self.p.processId()) == pid:
+        if self.pgid() == pid:
             try:
                 os.killpg(pid, sig)
             except ProcessLookupError:
@@ -201,6 +284,7 @@ class Proc(QtCore.QObject):
         self.log.moveCursor(QtGui.QTextCursor.End)
 
     def _finished(self, code, _status):
+        self.stopping = False
         self.log.appendPlainText(f'\n[{self.name} exited, code {code}]\n')
         self.file.note(f'[{self.name} exited, code {code}]')
         self.changed.emit()
@@ -291,6 +375,35 @@ def emoji_pixmap(emoji, size=128):
     return pm.copy(QtCore.QRect(QtCore.QPoint(min(xs), min(ys)), QtCore.QPoint(max(xs) + 1, max(ys) + 1)))
 
 
+class TitleDot(QtCore.QObject):
+    """Small circle right after a group box title. The title's place depends on the style, so ask
+    the style again whenever the box is shown or resized."""
+    SIZE = 10
+
+    def __init__(self, box):
+        super().__init__(box)
+        self.box = box
+        self.dot = QtWidgets.QLabel(box)
+        self.dot.setFixedSize(self.SIZE, self.SIZE)
+        box.installEventFilter(self)
+
+    def set_color(self, color):
+        self.dot.setStyleSheet(f'background:{color}; border-radius:{self.SIZE // 2}px')
+
+    def place(self):
+        opt = QtWidgets.QStyleOptionGroupBox()
+        self.box.initStyleOption(opt)
+        r = self.box.style().subControlRect(QtWidgets.QStyle.CC_GroupBox, opt,
+                                            QtWidgets.QStyle.SC_GroupBoxLabel, self.box)
+        self.dot.move(r.right() + 6, r.center().y() - self.SIZE // 2 + 1)
+        self.dot.raise_()
+
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QtCore.QEvent.Resize, QtCore.QEvent.Show):
+            self.place()
+        return False
+
+
 def fixed_font():
     f = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
     f.setPointSizeF(f.pointSizeF() * FONT_SCALE)
@@ -318,6 +431,9 @@ class Panel(QtWidgets.QWidget):
         self.joy_live = False      # gamepad on and /joy arriving
         self.brake_until = 0.0     # keep braking this long after the gamepad is turned off
         self.rest_v = None         # smoothed pack voltage at low current, for the charge estimate
+        self.remote = False        # panel_server.py runs: this window only shows status and logs
+        self.estop_req_t = 0.0     # when E-STOP was last pressed here while inactive
+        self.passthrough = {}      # server programs this panel has no tab for (pad reader): handed back as is
 
         self.tabs = nofocus(QtWidgets.QTabWidget())
         f = self.tabs.tabBar().font()
@@ -430,19 +546,16 @@ class Panel(QtWidgets.QWidget):
         box = QtWidgets.QGroupBox('실행')
         g = QtWidgets.QGridLayout(box)
         g.setVerticalSpacing(2)
-        self.run_btn = {}
-        for r, (key, label, tip) in enumerate([('bringup', 'Driver', '라이다 + VESC'),
+        # the name sits in the button, green while running, 2x2 to save room
+        self.run_btn, self.run_name = {}, {}
+        for i, (key, label, tip) in enumerate([('bringup', 'Driver', '라이다 + VESC'),
                                                ('slam', 'SLAM', '맵 만들기'),
                                                ('localize', 'AMCL', '위치 추정'),
                                                ('rviz', 'RViz', '')]):
-            name = QtWidgets.QLabel(label)
-            name.setToolTip(tip)
-            g.addWidget(name, r, 0)
-            b = self._button('켜기', lambda _=False, k=key: self.toggle(k))
+            b = self._button(label, lambda _=False, k=key: self.toggle(k))
             b.setToolTip(tip)
-            self.run_btn[key] = b
-            g.addWidget(b, r, 1)
-        g.setColumnStretch(0, 1)   # spare width goes to the labels, not the buttons
+            self.run_btn[key], self.run_name[key] = b, label
+            g.addWidget(b, i // 2, i % 2)
         return box
 
     def _map_box(self):
@@ -451,22 +564,37 @@ class Panel(QtWidgets.QWidget):
         self.map_cb = self._combo()
         self.map_cb.currentIndexChanged.connect(self.map_changed)
         g.addWidget(self.map_cb, 0, 0)
-        g.addWidget(self._button('새로고침', self.reload_lists), 0, 1)
+        reload_btn = self._small_icon_button('\U0001f504', self.reload_lists, '새로고침')
+        g.addWidget(reload_btn, 0, 1)
+        # no red background: it must not look like E-STOP
+        g.addWidget(self._small_icon_button('\U0001f5d1\ufe0f', self.delete_map,
+                                            '선택한 맵 삭제 (휴지통 폴더로 옮겨요)'), 0, 2)
         self.map_name = QtWidgets.QLineEdit(placeholderText='저장 이름')
         self.map_name.setMinimumWidth(10)
         g.addWidget(self.map_name, 1, 0)
         self.save_btn = self._button('맵 저장', self.save_map)
-        g.addWidget(self.save_btn, 1, 1)
+        g.addWidget(self.save_btn, 1, 1, 1, 2)
         g.addWidget(self._button('웨이포인트 편집', self.edit_waypoints), 2, 0)
         self.map_edit_btn = self._button('맵 편집', self.edit_map)
         self.map_edit_btn.setToolTip('벽 지우기/그리기. 처음 저장할 때 원본을 <맵>_orig.pgm으로 보관해요.\n'
                                      '저장한 맵은 위치 추정을 다시 켜야 적용돼요.')
-        g.addWidget(self.map_edit_btn, 2, 1)
+        g.addWidget(self.map_edit_btn, 2, 1, 1, 2)
         g.setColumnStretch(0, 1)
         return box
 
+    def _small_icon_button(self, emoji, slot, tip):
+        b = self._button('', slot)
+        size = self.fontMetrics().height()
+        b.setIcon(QtGui.QIcon(emoji_pixmap(emoji)))
+        b.setIconSize(QtCore.QSize(size, size))
+        b.setToolTip(tip)
+        return b
+
     def _auto_box(self):
         box = QtWidgets.QGroupBox('자율주행')
+        # grey off, yellow starting, green ready (status arriving, whoever started it)
+        self.pp_dot = TitleDot(box)
+        self.pp_dot.set_color(DOT_OFF)
         g = QtWidgets.QGridLayout(box)
         self.wp_cb = self._combo()
         g.addWidget(QtWidgets.QLabel('웨이포인트'), 0, 0)
@@ -475,8 +603,9 @@ class Panel(QtWidgets.QWidget):
         self.vmax = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=6.0, singleStep=0.1, value=1.0,
                                              suffix=' m/s')
         g.addWidget(self.vmax, 1, 1, 1, 3)
-        self.reloc_btn = self._button('위치 찾기', self.relocalize)
-        self.reloc_btn.setToolTip('맵 전체에서 현재 위치를 다시 찾아요')
+        # button colours follow the pad: X blue 위치 찾기, A green 출발, Y yellow 정지, B red E-STOP
+        self.reloc_btn = self._button('위치 찾기', self.relocalize, '#1565c0')
+        self.reloc_btn.setToolTip('맵 전체에서 현재 위치를 다시 찾아요 (패드: RB + X 두 번)')
         g.addWidget(self.reloc_btn, 2, 0, 1, 2)
         self.pp_btn = self._button('자율주행 준비', lambda: self.toggle('pp'))
         g.addWidget(self.pp_btn, 2, 2, 1, 2)
@@ -518,8 +647,14 @@ class Panel(QtWidgets.QWidget):
                                          'RB 누른 채 RT 가속, LT 후진, 왼쪽 스틱 조향\n'
                                          'LB 자율주행 허용   둘 다 놓으면 정지\n'
                                          '주황색: 켜져 있지만 패드 입력이 없어요 (연결·전원 확인)')
+        # only while the Mac panel drives, where the Mac panel has its 연결 해제 button
+        self.take_btn = self._icon_button('\U0001f4e5', self.request_takeover,
+                                          '제어 가져오기: 맥 제어판 연결을 끊고 여기서 바로 이어받아요.\n'
+                                          '켜져 있는 프로그램과 자율주행은 그대로 계속돼요.')
+        self.take_btn.hide()
         row.addWidget(self.manual_btn)
         row.addWidget(self.joy_btn)
+        row.addWidget(self.take_btn)
         row.addWidget(self.estop_btn, 1)
         return row
 
@@ -691,6 +826,30 @@ class Panel(QtWidgets.QWidget):
         self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()}')
         self.tabs.setCurrentWidget(self.procs['editor'].log)
 
+    def delete_map(self):
+        m = self.selected_map()
+        if not m:
+            return self.warn('지울 맵이 없어요.')
+        name = map_label(m)
+        if self.procs['localize'].running() and self.loc_map == m:
+            return self.warn(f'위치 추정이 {name} 맵으로 켜져 있어요. 위치 추정을 끄고 지우세요.')
+        if self.procs['pp'].running() and self.pp_setup[0] == m:
+            return self.warn(f'자율주행이 {name} 맵으로 켜져 있어요. 자율주행을 끄고 지우세요.')
+        mine, wps = map_files(m)
+        exts = ' '.join(os.path.basename(p)[len(name):] for p in mine)
+        if QtWidgets.QMessageBox.question(
+                self, '맵 삭제', f'{name} 맵을 지울까요?\n맵: {exts}\n'
+                f'웨이포인트: {", ".join(os.path.basename(p) for p in wps) or "없음"}\n'
+                '→ maps/휴지통/ 으로 옮겨요 (되살릴 수 있어요)') != QtWidgets.QMessageBox.Yes:
+            return
+        # moved, not deleted, so a wrong click can be undone
+        dest = os.path.join(MAPS, '휴지통', f'{time.strftime("%m%d_%H%M%S")}_{name}')
+        os.makedirs(dest, exist_ok=True)
+        for p in mine + wps:
+            shutil.move(p, os.path.join(dest, os.path.basename(p)))
+        self.procs['tool'].log.appendPlainText(f'[맵 삭제] {name} → {dest}\n')
+        self.reload_lists()
+
     def edit_map(self):
         if not self.selected_map():
             return self.warn('맵이 없어요.')
@@ -742,8 +901,14 @@ class Panel(QtWidgets.QWidget):
             return self.warn('드라이버를 먼저 켜세요.')
         if self.manual:
             self.toggle_manual()
-        pr.start('ros2 launch f1tenth_stack joy_launch.py')
         self.tabs.setCurrentWidget(pr.log)
+        # the server may be reading the pad for its pad commands, and one pad cannot be opened
+        # twice: stop that reader (the server leaves the pad alone while this one publishes /joy)
+        if subprocess.run(['pkill', '-INT', '-f', 'f710_xinput'], check=False).returncode == 0:
+            pr.log.appendPlainText('[패드 명령용 읽기를 끄고 1.5초 뒤 켜요]\n')
+            QtCore.QTimer.singleShot(1500, lambda: pr.start('ros2 launch f1tenth_stack joy_launch.py'))
+            return
+        pr.start('ros2 launch f1tenth_stack joy_launch.py')
 
     def stop_joy(self):
         if self.procs['joy'].running():
@@ -756,7 +921,66 @@ class Panel(QtWidgets.QWidget):
             self.ros.pp('estop')
             self.target = self.speed = 0.0
             self.stop_joy()   # LB would otherwise still reach /teleop alongside the zeros
+        if self.remote:
+            # brake here at once (tick), and have the server brake and show it on the Mac too
+            self.estop_req_t = time.time()
+            try:
+                with open(ESTOP_REQ, 'w') as f:
+                    f.write('on' if self.estop else 'off')
+            except OSError:
+                pass
         self.refresh()
+
+    def request_takeover(self):
+        if QtWidgets.QMessageBox.question(
+                self, '제어 가져오기', '맥 제어판 연결을 끊고 여기서 제어할까요?\n'
+                '켜져 있는 프로그램과 자율주행은 그대로 계속돼요.') != QtWidgets.QMessageBox.Yes:
+            return
+        try:
+            with open(TAKEOVER_REQ, 'w') as f:
+                f.write(str(os.getpid()))
+        except OSError as e:
+            return self.warn(f'요청을 쓰지 못했어요: {e}')
+        QtCore.QTimer.singleShot(3000, self.check_takeover)
+
+    def check_takeover(self):
+        if self.remote:   # the server polls every 0.3 s: it is stuck or gone
+            self.warn('서버가 응답하지 않아요.\n터미널에서 systemctl --user stop panel_server 를 실행하면 '
+                      '여기서 이어받아요.')
+
+    def follow_pad_command(self):
+        """A pad command the server read while this panel drives: do what the same button here does.
+        With no screen and no network the pad is the only way left to work the car."""
+        try:
+            with open(PAD_REQ) as f:
+                name = f.read().strip()
+            os.remove(PAD_REQ)
+        except OSError:
+            return
+        self.procs['joy'].log.appendPlainText(f'[패드 명령] {name}\n')
+        if name == 'relocalize':
+            self.relocalize()
+        elif name == 'go':
+            self.go()
+        elif name == 'stop':
+            self.ros.pp('stop')
+        elif name == 'estop' and not self.estop:
+            self.toggle_estop()
+        elif name == 'estop_release' and self.estop:
+            self.toggle_estop()
+
+    def follow_server_estop(self):
+        """While inactive, show the server's E-STOP (pressed on the Mac or here)."""
+        try:
+            if os.path.getmtime(ESTOP_STATE) <= self.estop_req_t:
+                return   # the server has not answered the last press here yet
+            with open(ESTOP_STATE) as f:
+                on = f.read().strip() == 'on'
+        except (OSError, ValueError):
+            return
+        if on != self.estop:
+            self.estop = on
+            self.refresh()
 
     # ---------- keyboard (manual mode) ----------
     def eventFilter(self, obj, ev):
@@ -787,7 +1011,65 @@ class Panel(QtWidgets.QWidget):
         return False
 
     # ---------- loops ----------
+    def set_remote(self, on):
+        """While the Mac panel's server runs, stop driving and grey out the controls instead of
+        closing: two /teleop publishers would fight. Status and logs keep updating."""
+        self.remote = on
+        if on:
+            self.manual = False
+            self.target = self.speed = 0.0
+            self.stop_joy()
+            self.hand_over()
+        self.scroll.setEnabled(not on)
+        # E-STOP stays live: with the Mac out of reach this is the only stop at the car
+        for b in (self.manual_btn, self.joy_btn):
+            b.setEnabled(not on)
+        self.take_btn.setVisible(on)
+        self.setWindowTitle('F1TENTH 제어판 (맥 원격 제어 중 - 비활성)' if on else 'F1TENTH 제어판')
+        self.refresh()
+
+    def hand_over(self):
+        """Tell the server which programs are running so the Mac can turn them off."""
+        procs = {k: p.pgid() for k, p in self.procs.items() if p.pgid() is not None}
+        out = {k: self.procs[k].out for k in procs if self.procs[k].adopted and self.procs[k].out}
+        for k, (pgid, path) in self.passthrough.items():
+            if group_alive(pgid):
+                procs[k] = pgid
+                if path:
+                    out[k] = path
+        self.passthrough = {}
+        h = {'from': 'panel', 'procs': procs, 'out': out, 'loc_map': self.loc_map,
+             'pp_setup': list(self.pp_setup), 'estop': self.estop}
+        try:
+            with open(HANDOFF + '.tmp', 'w') as f:
+                json.dump(h, f)
+            os.replace(HANDOFF + '.tmp', HANDOFF)
+        except OSError:
+            pass
+        self.estop = False   # the server keeps braking if this panel was
+
+    def take_over(self):
+        """The Mac disconnected: adopt what panel_server.py left running."""
+        h = read_handoff()
+        if not h:
+            return
+        outs = h.get('out') or {}
+        for k, pgid in (h.get('procs') or {}).items():
+            if k in self.procs:
+                self.procs[k].adopt(int(pgid), outs.get(k))
+            else:
+                self.passthrough[k] = (int(pgid), outs.get(k))
+        if h.get('loc_map'):
+            self.loc_map = h['loc_map']
+        if h.get('pp_setup') and any(h['pp_setup']):
+            self.pp_setup = tuple(h['pp_setup'])
+        if h.get('estop'):
+            self.estop = True
+        self.refresh()
+
     def tick(self):
+        if self.remote and not self.estop:
+            return   # panel_server.py publishes /teleop; an E-STOP is braked from here too
         now = time.monotonic()
         dt, self.last_t = now - self.last_t, now
         if self.estop or now < self.brake_until:
@@ -803,6 +1085,15 @@ class Panel(QtWidgets.QWidget):
 
     def refresh_status(self):
         r, now = self.ros, time.monotonic()
+        if remote_server_running() != self.remote:
+            self.set_remote(not self.remote)
+        if not self.remote:
+            self.take_over()
+            self.follow_pad_command()
+        else:
+            self.follow_server_estop()
+        if any(p.adopted for p in self.procs.values()):
+            self.refresh()   # adopted programs send no exit signal
         while r.events:
             text = r.events.pop(0)
             stamped = time.strftime('%H:%M:%S ') + text
@@ -832,6 +1123,8 @@ class Panel(QtWidgets.QWidget):
             put('battery', '-', False)
             put('vesc', '연결 없음', False)
             put('speed', '-', False)
+        ready = now - r.pp_status_t < 2.0
+        self.pp_dot.set_color('#2e7d32' if ready else '#f9a825' if self.procs['pp'].running() else DOT_OFF)
         hz = len(r.scan_times)
         put('lidar', f'{hz} Hz', True if hz >= 30 else (None if hz > 0 else False))
         pose = r.pose()
@@ -846,9 +1139,14 @@ class Panel(QtWidgets.QWidget):
 
     def refresh(self):
         for key, b in self.run_btn.items():
-            on = self.procs[key].running()
-            b.setText('끄기' if on else '켜기')
-            b.setStyleSheet('background:#2e7d32; color:white' if on else '')
+            pr = self.procs[key]
+            on = pr.running()
+            if not on:
+                pr.stopping = False   # an adopted program ended
+            stopping = on and pr.stopping
+            b.setText(f'{self.run_name[key]} (끄는 중)' if stopping else self.run_name[key])
+            b.setEnabled(not stopping)
+            b.setStyleSheet('background:#2e7d32; color:white' if on and not stopping else '')
         pp_on = self.procs['pp'].running()
         self.pp_btn.setText('자율주행 끄기' if pp_on else '자율주행 준비')
         self.go_btn.setEnabled(pp_on and not self.estop)
@@ -864,6 +1162,9 @@ class Panel(QtWidgets.QWidget):
             + ' color:white; font-weight:bold')
 
     def closeEvent(self, ev):
+        if self.remote:   # the Mac panel owns the programs and the car now
+            ev.accept()
+            return
         running = [p.name for p in self.procs.values() if p.running()]
         if running and QtWidgets.QMessageBox.question(
                 self, '종료', '실행 중인 것을 모두 끄고 종료할까요?\n' + ', '.join(running)

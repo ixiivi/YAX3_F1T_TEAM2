@@ -38,21 +38,21 @@ slam_toolbox:
     # General Parameters
     use_scan_matching: true
     use_scan_barycenter: true
-    minimum_travel_distance: 0.5
-    minimum_travel_heading: 0.5
-    scan_buffer_size: 10
+    minimum_travel_distance: 0.2  # was 0.5 (2026-11-11): add a scan every 0.2 m
+    minimum_travel_heading: 0.15  # was 0.5 (2026-11-11): ... or 0.15 rad (9 deg): a U-turn gets ~20 scans, not ~6
+    scan_buffer_size: 20  # was 10 (2026-11-11): match against more recent scans (same 4 m of track at 0.2 m)
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1  
     link_scan_maximum_distance: 1.5
-    loop_search_maximum_distance: 3.0
+    loop_search_maximum_distance: 4.0  # was 3.0 (2026-11-11): look for the earlier pass this far away
     do_loop_closing: true 
-    loop_match_minimum_chain_size: 10           
+    loop_match_minimum_chain_size: 5  # was 10 (2026-11-11): close a loop after 5 matching scans (1 m), not 10 (5 m)
     loop_match_maximum_variance_coarse: 3.0  
     loop_match_minimum_response_coarse: 0.35    
     loop_match_minimum_response_fine: 0.45
 
     # Correlation Parameters - Correlation Parameters
-    correlation_search_space_dimension: 0.5
+    correlation_search_space_dimension: 0.8  # was 0.5 (2026-11-11): each scan may correct the pose by up to +-0.4 m
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1 
 
