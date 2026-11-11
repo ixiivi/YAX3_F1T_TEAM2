@@ -9,6 +9,11 @@ SPACING = 0.10      # m between output waypoints
 HANDLE_EVERY = 10   # saved waypoints per editable point when a path is reopened (about 1 m)
 HANDLE_TOLERANCE = 0.02  # m: a reopened path may differ from the saved one by this much
 BOOST, BRAKE = 'boost', 'brake'   # full-throttle / full-brake marks and the zones they make
+RESUME = 'resume'                 # mark: back to the track speed after a full-throttle zone
+# the car's rates in those zones: pure_pursuit's defaults and the editor's plan, kept in one place
+BOOST_ACCEL = 6.0   # [m/s^2] full throttle (tyres may spin a little; measured later)
+BRAKE_DECEL = 4.0   # [m/s^2] full brake
+STOP_DECEL = 3.0    # [m/s^2] plain slow-down (pure_pursuit stop_decel)
 
 
 def smooth_path(pts, closed):
@@ -235,32 +240,25 @@ def speed_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake=None):
     return np.maximum(v, vmin)
 
 
-def race_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake, marks=(), a_boost=5.0, a_full=4.0,
-                 minor_dip=0.5):
-    """speed_profile with full-throttle and full-brake marks: (speeds, zones).
+def race_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake, marks=(), a_boost=BOOST_ACCEL,
+                 a_full=BRAKE_DECEL, a_stop=STOP_DECEL):
+    """speed_profile (the track speed) with the driver's marks on top: (speeds, zones).
 
-    marks: (waypoint index, BOOST or BRAKE). From a BOOST mark the car speeds up at a_boost (up to
-    vmax and what the curves allow) until it has to brake at a_full for the next corner, then
-    brakes at a_full into it (that part is zone BRAKE). A BRAKE mark starts that full braking
-    right there, also cutting a boost short, down to the speed of the next corner. Every run ends
-    at the next mark at the latest. A BOOST mark placed before a corner's slowest point starts
-    there. A dip in curve speed less than minor_dip [m/s] below the top speed of the run is not a
-    corner (curvature noise, a kink inside one corner): the boost carries on after it. Zones are '' where the normal profile applies."""
+    marks: (waypoint index, BOOST, BRAKE or RESUME), each acting until the next mark:
+      BOOST   speed up at a_boost from the speed there, past curve speeds and vmax (only
+              pure_pursuit's max_speed caps it), until the next mark. Zone BOOST.
+      BRAKE   slow down at a_full until the track speed is reached, then the track speed.
+              Zone BRAKE.
+      RESUME  back to the track speed: where that is slower, down at a_stop (pure_pursuit's
+              stop_decel, what the car does without a zone).
+    Nothing is decided automatically: a BOOST without a BRAKE or RESUME after it keeps going.
+    Zones are '' where the track speed (or the plain slow-down to it) applies."""
     v = speed_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake)
     n = len(xy)
     zone = np.array([''] * n, dtype=object)
     if not len(marks) or n < 3:
         return v, zone
-    k = curvature(xy, closed)
-    with np.errstate(divide='ignore'):
-        vc = np.maximum(np.minimum(vmax, np.sqrt(a_lat / np.maximum(k, 1e-6))), vmin)
     ds = np.linalg.norm(np.diff(xy, axis=0, append=xy[:1] if closed else xy[-1:]), axis=1)
-    # the latest the car can brake at a_full for every corner ahead
-    vb = vc.copy()
-    for _ in range(2 if closed else 1):
-        for i in range(n - 2, -1 if not closed else -2, -1):
-            j, nx = i % n, (i + 1) % n
-            vb[j] = min(vb[j], np.sqrt(vb[nx] ** 2 + 2 * a_full * ds[j]))
     marks = sorted({int(i) % n: kind for i, kind in marks}.items())
     out = v.copy()
     for m, (i, kind) in enumerate(marks):
@@ -268,50 +266,22 @@ def race_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake, marks=(), a_boos
             stop = marks[m + 1][0]
         else:
             stop = marks[0][0] + n if closed else n - 1
-        if kind == BOOST:    # placed in a corner: flat out from its slowest point on
-            while i < stop and vb[(i + 1) % n] <= vb[i % n] + 1e-9:
-                i += 1
-            i %= n if closed else n + 1
-        cur, braking, target = out[i], kind == BRAKE, None
-        zone[i], top, slowing = kind, cur, []
-        if braking:   # down to the next corner: the first dip in curve speed below the speed here
-            ahead = [s % n for s in range(i + 1, stop + 1)] if closed else range(i + 1, stop + 1)
-            dips = [q for q in ahead if vc[q] < cur and vc[q] <= vc[(q + 1) % n] if q + 1 < n or closed]
-            target = vc[dips[0]] if dips else cur
+        cur = out[i]
+        if kind == BOOST or kind == BRAKE and cur > v[i] + 1e-9:   # a brake at track speed: none
+            zone[i] = kind
         for step in range(i, stop):
             j, q = step % n, (step + 1) % n
-            if not braking:
-                up = np.sqrt(cur ** 2 + 2 * a_boost * ds[j])
-                # through a curve the curve speed caps it; only braking for one ahead ends it
-                if up <= vb[q] or vb[q] >= vc[q] - 1e-6:
-                    cur, zone[q] = min(up, vb[q]), BOOST
-                    out[q], top, slowing = cur, max(top, cur), []
-                    continue
-                braking = True
-            if target is None:      # braking out of a boost: just as hard as the corner needs
-                if vb[q] <= v[q] + 1e-6:
-                    if top - vb[q] < minor_dip:     # not a real corner: keep going flat out
-                        braking, cur, zone[q] = False, vb[q], BOOST
-                        out[q] = cur
-                        zone[slowing] = BOOST       # one zone, shown as one
-                        continue
-                    break
-                cur, zone[q] = vb[q], BRAKE
-                slowing.append(q)
+            if kind == BOOST:
+                cur = np.sqrt(cur ** 2 + 2 * a_boost * ds[j])
+                zone[q] = BOOST
             else:
-                down = np.sqrt(max(cur ** 2 - 2 * a_full * ds[j], 0.0))
-                if v[q] <= target + 1e-6:
-                    break          # reached the corner: the normal profile is slower from here
-                cur = min(max(down, target), vb[q])
-                if down > target:
+                down = np.sqrt(max(cur ** 2 - 2 * (a_full if kind == BRAKE else a_stop) * ds[j], 0.0))
+                if down <= v[q]:
+                    break                # at the track speed: it takes over from here
+                cur = down
+                if kind == BRAKE:
                     zone[q] = BRAKE
-            out[q] = min(cur, vb[q]) if zone[q] else min(cur, v[q])
-    # after a run the normal profile picks up again with its own speed-up
-    for _ in range(2 if closed else 1):
-        for i in range(1, n if not closed else n + 1):
-            j, p = i % n, (i - 1) % n
-            if not zone[j]:
-                out[j] = min(out[j], np.sqrt(out[p] ** 2 + 2 * a_lon * ds[p]))
+            out[q] = cur
     return np.maximum(out, vmin), zone
 
 

@@ -354,8 +354,9 @@ def test_marks_make_full_throttle_and_brake_zones_and_survive_save_and_reopen(ed
     ed.start_placing(we.BOOST)
     click(ed, tuple(xy[j]))
     assert ed.placing is None and [m[0] for m in ed.marks] == [we.BOOST]
-    _, v1, zone = ed.profile()
+    _, v1, zone, track = ed.profile()
     assert (zone == we.BOOST).any() and v1.max() > v0.max() + 0.1
+    assert np.allclose(track, v0)                  # the track speed is the one without marks
     ed.start_placing(we.BRAKE)
     click(ed, tuple(xy[(j + len(xy) // 3) % len(xy)]))
     assert len(ed.marks) == 2
@@ -408,3 +409,27 @@ def test_racing_line_on_a_selection_keeps_its_ends(editor):
     xy1 = ed.build()[0]
     for e in ends:
         assert min(np.linalg.norm(xy1 - e, axis=1)) < 0.03
+
+
+def test_hovering_the_path_shows_the_speed_there(editor):
+    ed = editor(route=True)
+    xy, v = ed.speeds()
+    mouse(ed, 'motion_notify_event', tuple(xy[40]))
+    assert ed.hover is not None and ed.hover.get_visible()
+    assert f'{v[40]:.1f} m/s' in ed.hover.get_text()
+    mouse(ed, 'motion_notify_event', tuple(xy[40] + ed.build()[0].std(0)))   # off the path
+    assert not ed.hover.get_visible() or f'{v[40]:.1f}' not in ed.hover.get_text()
+
+
+def test_a_selection_tool_keeps_the_loop_start_and_a_tiny_selection_changes_nothing(editor):
+    ed = editor(route=True)
+    first = ed.pts[0]
+    xy = ed.build()[0]
+    n = len(xy)
+    select(ed, np.arange(n // 2, n // 2 + 30))
+    ed.straighten()
+    assert np.allclose(ed.pts[0], first)
+    held = list(ed.pts)
+    ed.sel = (tuple(xy[5]), tuple(xy[5]), tuple(xy[6]))
+    ed.smooth()
+    assert ed.pts == held

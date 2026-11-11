@@ -104,6 +104,11 @@ def test_full_throttle_and_full_brake_zones_change_only_the_ramp_rates(bare_pp, 
     assert pp.ramp(5.0, 'boost') == pytest.approx(2.0 + 5.0 * pp.dt)
     assert pp.ramp(1.0, 'brake') == pytest.approx(2.0 - 4.0 * pp.dt)
     assert pp.ramp(1.0, 'boost') == pytest.approx(2.0 - 2.0 * pp.dt)
+    # full throttle grows smoothly from accel at full lock to boost_accel at the centre
+    steps = [(pp.ramp(5.0, 'boost', s) - 2.0) / pp.dt for s in np.linspace(pp.max_steer, 0.0, 9)]
+    assert steps[0] == pytest.approx(1.5) and steps[-1] == pytest.approx(5.0)
+    assert (np.diff(steps) > 0).all()
+    assert steps[-1] - steps[-2] < steps[4] - steps[3]      # flat as it reaches the centre
     # a plain route has no zone column; a route with marks has one
     xy = np.column_stack([np.arange(5.0), np.zeros(5)])
     write_csv(tmp_path / 'a.csv', xy, np.ones(5))

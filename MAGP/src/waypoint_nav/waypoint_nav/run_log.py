@@ -8,13 +8,18 @@ Which column answers what:
   fit low                         localization is off (walls can then look like obstacles)
   n_contact, scan_change, frozen_s  the hit signals; check them first after a false recovery
   skew                            pose offset added to the obstacle threshold (high = pose off)
+  v_plan, zone, v_odom            the route's speed (and full-throttle / full-brake zone) at the car
+                                  against the measured speed: where a mark is early or late
+  ax, ay, wz                      VESC IMU (sensors/imu/raw) forward / sideways acceleration and
+                                  yaw rate, as the VESC sends them (g and deg/s, unconverted):
+                                  grip used in corners, how hard it really brakes
 """
 import csv
 import os
 import time
 
 FIELDS = ('t', 'x', 'y', 'yaw', 'i', 'off_path', 'mode', 'running', 'status',
-          'v_want', 'cmd_v', 'cmd_steer', 'offset', 'goal', 'n_obs', 'n_clusters', 'skew', 'n_free', 'n_cand',
+          'v_want', 'cmd_v', 'v_plan', 'zone', 'v_odom', 'ax', 'ay', 'wz', 'cmd_steer', 'offset', 'goal', 'n_obs', 'n_clusters', 'skew', 'n_free', 'n_cand',
           'fit', 'corrections', 'attempts', 'n_contact', 'n_contact_front', 'scan_change',
           'frozen_s', 'event')
 

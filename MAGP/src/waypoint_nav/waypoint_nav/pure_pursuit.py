@@ -46,12 +46,14 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
 from rclpy.time import Time
 from scipy.spatial import cKDTree
-from sensor_msgs.msg import LaserScan
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
 from waypoint_nav.global_localize import initial_pose_msg
+from waypoint_nav.path_tools import BOOST, BOOST_ACCEL, BRAKE, BRAKE_DECEL, STOP_DECEL
 from waypoint_nav.run_log import RunLog
 from waypoint_nav.scan_match import MapMatcher, scan_rays
 
@@ -109,11 +111,13 @@ class PurePursuit(Node):
         p('laser_x', 0.267)          # laser position ahead of base_link [m] (6.3 cm behind front axle)
         p('pose_timeout', 0.5)       # [s]
         p('accel', 3.5)              # [m/s^2] speed-up limit (the CSV's corner-exit speed-up is 3.0)
-        p('stop_decel', 3.0)         # [m/s^2] motor-controlled slow-down for space / slower corners
-        # full-throttle / full-brake zones from the waypoint editor's marks (zone column)
-        p('boost_accel', 5.0)        # [m/s^2] speed-up in a full-throttle zone
-        p('brake_decel', 4.0)        # [m/s^2] slow-down in a full-brake zone
-        p('boost_max_speed', 0.0)    # [m/s] cap in those zones instead of max_speed; 0 = the CSV
+        p('stop_decel', STOP_DECEL)  # [m/s^2] motor-controlled slow-down for space / slower corners
+        # full-throttle / full-brake zones from the waypoint editor's marks (zone column). The
+        # editor plans with the same path_tools values: change them there, not with -p
+        p('boost_accel', BOOST_ACCEL)  # [m/s^2] speed-up in a full-throttle zone, steering centred
+        p('brake_decel', BRAKE_DECEL)  # [m/s^2] slow-down in a full-brake zone
+        # in a full-throttle zone this replaces steer_alat (corner exits speed up early); 0 = off
+        p('boost_steer_alat', 4.0)   # [m/s^2]
         # target the CSV speed this far ahead [s of driving]: speeds up before the faster part
         # and honours any slower point within it early. Off by default: in a lap simulation
         # (2026-11-09) 0.3 s made every corner apex 0.3-0.4 m/s too fast for the CSV's lateral
@@ -246,14 +250,11 @@ class PurePursuit(Node):
             self.get_logger().warn(
                 f'max_speed {gp("max_speed"):.2f} is above the CSV speeds (max {csv_max:.2f}); '
                 'the CSV wins. Regenerate the waypoints with a higher vmax or raise speed_scale.')
-        # the zones are where the route says flat out: max_speed (the panel's) does not cap them
-        flat_out = self.zone != ''
-        cap = np.where(flat_out, gp('boost_max_speed') or np.inf, gp('max_speed'))
-        self.v_ref = np.minimum(self.v_ref * gp('speed_scale'), cap)
-        if flat_out.any():
+        self.v_ref = np.minimum(self.v_ref * gp('speed_scale'), gp('max_speed'))
+        if (self.zone != '').any():
             self.get_logger().info(
-                f'full-throttle / full-brake zones: {int(flat_out.sum())} waypoints, '
-                f'up to {self.v_ref[flat_out].max():.2f} m/s')
+                f'full throttle {int((self.zone == BOOST).sum())} / full brake '
+                f'{int((self.zone == BRAKE).sum())} waypoints (max_speed still caps them)')
         self.get_logger().info(
             f'{len(self.xy)} waypoints from {wp_file}, '
             f'{"closed loop" if self.closed else "open path"}, '
@@ -303,6 +304,10 @@ class PurePursuit(Node):
         self.avoid_pub = self.create_publisher(Path, '/pure_pursuit/avoid_path', 10)
         self.pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
+        # for the run log only: measured speed and accelerations, to compare with the plan
+        self.odom_v = self.imu = None
+        self.create_subscription(Odometry, '/odom', self.on_odom, 10)
+        self.create_subscription(Imu, '/sensors/imu/raw', self.on_imu, qos_profile_sensor_data)
         # remote control (control panel): 'go', 'stop' (smooth), 'estop' (brake now)
         self.create_subscription(String, '/pure_pursuit/command', self.on_command, 10)
         self.status_pub = self.create_publisher(String, '/pure_pursuit/status', 10)
@@ -400,6 +405,13 @@ class PurePursuit(Node):
         self.event_pub.publish(String(data=text))
         self.events.append(text)
 
+    def on_odom(self, msg):
+        self.odom_v = msg.twist.twist.linear.x
+
+    def on_imu(self, msg):
+        a, w = msg.linear_acceleration, msg.angular_velocity
+        self.imu = (a.x, a.y, w.z)
+
     def log_row(self):
         """One row of the run record, only while something is happening."""
         if not (self.running or self.mode != 'drive' or self.speed_cmd > 0.0):
@@ -410,6 +422,11 @@ class PurePursuit(Node):
             'i': self.idx, 'off_path': _num(self.err_seen), 'mode': self.mode,
             'running': int(self.running), 'status': self.status,
             'v_want': _num(self.v_want), 'cmd_v': _num(self.cmd[0]),
+            'v_plan': _num(self.v_ref[self.idx]) if self.idx is not None else '',
+            'zone': self.zone[self.idx] if self.idx is not None else '',
+            'v_odom': _num(self.odom_v),
+            'ax': _num(self.imu[0]) if self.imu else '', 'ay': _num(self.imu[1]) if self.imu else '',
+            'wz': _num(self.imu[2]) if self.imu else '',
             'cmd_steer': _num(self.cmd[1]), 'offset': _num(self.offset),
             'goal': _num(self.plan.get('goal')), 'n_obs': self.plan.get('n_obs', ''),
             'skew': _num(self.skew), 'n_clusters': self.plan.get('n_clusters', ''),
@@ -717,9 +734,10 @@ class PurePursuit(Node):
         v = max(v, 0.0)
         return self.car_front + self.aeb_base + v * self.aeb_delay + v * v / (2.0 * self.aeb_decel)
 
-    def turn_speed(self, steer):
-        """Fastest speed the car can take the turn of this steering at (steer_alat)."""
-        a = self.gp('steer_alat')
+    def turn_speed(self, steer, zone=''):
+        """Fastest speed the car can take the turn of this steering at (steer_alat; in a
+        full-throttle zone boost_steer_alat)."""
+        a = self.gp('boost_steer_alat' if zone == BOOST else 'steer_alat')
         k = abs(math.tan(steer)) / self.wheelbase
         return math.inf if a <= 0.0 or k < 1e-6 else math.sqrt(a / k)
 
@@ -905,14 +923,20 @@ class PurePursuit(Node):
         return bool((behind & (np.abs(p[:, 1]) < self.car_half_width + 0.1)).any())
 
     # ---------- speed ----------
-    def ramp(self, target, zone=''):
+    def ramp(self, target, zone='', steer=0.0):
         """Next speed command. Never commands the cogging band below min_speed: starting
         jumps to min_speed, stopping slows down by motor speed control to min_speed and
         then drops to 0 (brake). zone: the route's 'boost' / 'brake' zone at the car, where it
-        speeds up at boost_accel / slows down at brake_decel."""
+        speeds up at boost_accel / slows down at brake_decel. In a boost zone the speed-up
+        grows from accel at full lock to boost_accel with the steering centred, smoothly
+        (no jump as the wheel comes back, the full value right at the centre)."""
         cur = self.speed_cmd
-        accel = self.gp('boost_accel') if zone == 'boost' else self.accel
-        decel = self.gp('brake_decel') if zone == 'brake' else self.stop_decel
+        accel, decel = self.accel, self.stop_decel
+        if zone == BOOST:
+            s = min(abs(steer) / self.max_steer, 1.0)
+            accel += (self.gp('boost_accel') - accel) * (1.0 - s) ** 2 * (1.0 + 2.0 * s)
+        elif zone == BRAKE:
+            decel = self.gp('brake_decel')
         if target == 0.0:
             if cur <= self.min_speed + 1e-6:
                 return 0.0
@@ -1317,8 +1341,9 @@ class PurePursuit(Node):
         tx, ty = line[k]
         steer = self.clamp_steer(self.pursuit_steer(x, y, yaw, tx, ty))
 
-        v = self.ramp(v_ref if self.running else 0.0, self.zone[i] if self.running else '')
-        cap = self.turn_speed(steer)
+        zone = self.zone[i] if self.running else ''
+        v = self.ramp(v_ref if self.running else 0.0, zone, steer)
+        cap = self.turn_speed(steer, zone)
         if returning:
             cap = min(cap, self.gp('return_speed'))
         if v > cap:

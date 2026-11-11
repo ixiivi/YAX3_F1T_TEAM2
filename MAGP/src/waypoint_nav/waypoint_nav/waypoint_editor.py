@@ -18,9 +18,11 @@ Mouse on the map:
   right drag     move the view
   wheel          zoom in / out at the cursor
 
-Full throttle (F) and full brake (B) marks sit on the path: from a full-throttle mark the car
-speeds up as hard as it can until it must brake for the next corner; from a full-brake mark it
-brakes as hard as it can. Straight (L) turns the selection into one straight line; the path
+Full throttle (F), full brake (B) and back-to-track (E) marks sit on the path, each acting up
+to the next mark: from full throttle the car speeds up as hard as it can (past the curve
+speeds; only pure_pursuit's max_speed caps it), from full brake it brakes as hard as it can
+until it is down to the track speed, from back-to-track it slows down normally to the track
+speed. Hover over the path to see the speed there. Straight (L) turns the selection into one straight line; the path
 leaves and joins it along it. Drag its end points to move it.
 
 Keys: a add at the cursor (for remote desktops), z undo, c closed loop / open path,
@@ -46,10 +48,13 @@ from scipy import ndimage
 
 from waypoint_nav.map_editor import (BUTTON, KOREAN_FONTS, STYLE, ZOOM_STEP, _icon_lines,
                                      make_icon, zoomed)
-from waypoint_nav.path_tools import (BOOST, BRAKE, SPACING, build_path, curvature,
-                                     distance_to_polyline, handles_from_path, left_normals,
-                                     race_profile, racing_line, read_csv, read_marks, smooth_path,
-                                     smoothing_fit, wall_margins, write_csv)
+from scipy.spatial import cKDTree
+
+from waypoint_nav.path_tools import (BOOST, BOOST_ACCEL, BRAKE, BRAKE_DECEL, RESUME, SPACING,
+                                     STOP_DECEL, build_path, curvature, distance_to_polyline,
+                                     handles_from_path, left_normals, race_profile, racing_line,
+                                     read_csv, read_marks, smooth_path, smoothing_fit,
+                                     speed_profile, wall_margins, write_csv)
 
 WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
 LIMIT_DEFAULTS = {'alat': 2.0, 'alon': 3.0}   # used until a route is saved with other values
@@ -67,6 +72,8 @@ DRAG_START = 3      # screen pixels: less movement than this is a click, not a d
 SELECT_START = 8    # screen pixels: a press on empty map moved this far selects instead of adding
 GRAB_MARK = 30      # screen pixels: a full-throttle / full-brake mark lands on the path this close
 BOOST_COLOR, BRAKE_COLOR = '#2e7d32', '#c62828'   # the panel's go / E-STOP colours
+RESUME_COLOR = '#757575'
+MARKS = (BOOST, BRAKE, RESUME)
 SEL_COLOR = '#1565c0'
 FREE_MIN = 250      # map pixels at least this bright are free space (254); walls 0, unknown 205
 SMOOTH_DEVIATION = 0.05  # [m] how far one smoothing click may move the path, halved until it fits
@@ -95,8 +102,12 @@ TEXT = {
            'unsaved': '저장 안 된 변경 있음', 'need': '점이 {n}개 이상 필요해요',
            'same_spot': '두 점이 같은 자리에 있어 부드럽게 만들 수 없어요',
            'saved': '저장됨: 점 {n}개, {m:.1f} m, 속도 {v0:.2f}~{v1:.2f} m/s',
-           'boost': '풀악셀 점', 'boost_tip': '누른 뒤 경로를 클릭. 여기부터 다음 코너 진입부까지 최대 가속',
-           'brake': '풀브레이크 점', 'brake_tip': '누른 뒤 경로를 클릭. 여기부터 다음 코너 속도까지 최대 감속',
+           'boost': '풀악셀 점', 'boost_tip': '누른 뒤 경로를 클릭. 여기부터 다음 마크까지 최대 가속 (곡선 속도 무시)',
+           'brake': '풀브레이크 점', 'brake_tip': '누른 뒤 경로를 클릭. 여기부터 트랙 속도가 될 때까지 최대 감속',
+           'resume': '트랙 속도 복귀 점', 'resume_tip': '누른 뒤 경로를 클릭. 풀악셀을 끝내고 트랙 속도로 (느리면 평소 감속)',
+           'no_end': '풀악셀 뒤에 풀브레이크나 복귀 점이 없어요: 다음 마크까지 계속 가속해요',
+           'sel_short': '선택 구간이 너무 짧아요',
+           'hover': '{v:.1f} m/s (트랙 {vt:.1f})', 'zone_boost': '풀악셀', 'zone_brake': '풀브레이크',
            'straight': '직선 구간', 'straight_tip': '드래그로 선택한 구간을 직선 하나로. 양 끝 점을 끌어 옮기고, 선을 오른쪽 클릭하면 직선 해제',
            'race': '레이싱 라인', 'race_tip': '아웃-인-아웃: 벽 여유 안에서 곡률이 가장 작은 선으로. 선택 구간이 있으면 그 구간만, 없으면 전체',
            'place': '경로를 클릭해서 {what} 놓기 (Esc 취소)', 'placed': '{what}: 최고 {v:.1f} m/s',
@@ -128,8 +139,12 @@ TEXT = {
            'unsaved': 'unsaved changes', 'need': 'need at least {n} points',
            'same_spot': 'cannot smooth: two points are on the same spot',
            'saved': 'saved {n} pts, {m:.1f} m, v {v0:.2f}..{v1:.2f} m/s',
-           'boost': 'Full throttle mark', 'boost_tip': 'then click the path: flat out from here to the next corner',
-           'brake': 'Full brake mark', 'brake_tip': 'then click the path: brake as hard as possible from here to the next corner speed',
+           'boost': 'Full throttle mark', 'boost_tip': 'then click the path: flat out from here to the next mark (past curve speeds)',
+           'brake': 'Full brake mark', 'brake_tip': 'then click the path: brake as hard as possible until down to the track speed',
+           'resume': 'Back-to-track mark', 'resume_tip': 'then click the path: end full throttle, back to the track speed (normal slow-down)',
+           'no_end': 'a full throttle mark has no full brake or back-to-track mark after it: it speeds up until the next mark',
+           'sel_short': 'the selection is too short',
+           'hover': '{v:.1f} m/s (track {vt:.1f})', 'zone_boost': 'full throttle', 'zone_brake': 'full brake',
            'straight': 'Straight', 'straight_tip': 'turn the dragged selection into one straight line; drag its ends to move it, right click the line to undo it',
            'race': 'Racing line', 'race_tip': 'out-in-out: least curvature within the wall margins; the selection only if there is one',
            'place': 'click the path to place the {what} (Esc cancels)', 'placed': '{what}: top {v:.1f} m/s',
@@ -244,6 +259,12 @@ def _icon_lines_wp(name, p, QtCore, QtGui):
                                        P(8, 22), P(2, 16), P(2, 8)]))
         p.setBrush(QtGui.QColor('white'))
         p.drawRect(R(6, 10, 12, 4))
+    elif name == RESUME:        # flat grey disc with a black edge and a white "=" (track speed)
+        p.setBrush(QtGui.QColor(RESUME_COLOR))
+        p.drawEllipse(P(12, 12), 10, 10)
+        p.setBrush(QtGui.QColor('white'))
+        p.drawRect(R(6, 7.5, 12, 3))
+        p.drawRect(R(6, 13.5, 12, 3))
     elif name == 'straight':    # curve, straight line between two points, curve
         path = QtGui.QPainterPath(P(2, 20))
         path.cubicTo(P(3, 14), P(5, 12), P(7, 12))
@@ -297,14 +318,20 @@ class Editor:
         self.show_speed = False  # colour the path by the speed the CSV would store
         self.clearance = None    # [m] per map pixel, built on first use (see keep_off_walls)
         self.straight = set()    # gaps i (point i to point i+1) that are straight lines
-        self.marks = []          # [BOOST or BRAKE, (x, y) on the path]
+        self.marks = []          # [BOOST, BRAKE or RESUME, (x, y) on the path]
         self.sel = None          # selected part of the path: its (start, middle, end) points
         self.press = None        # (screen x, y, world point, moved) while left-dragging empty map
         self.placing = None      # BOOST / BRAKE while waiting for a click on the path
         self.mark_drag = None    # index of the mark held by the mouse
         self._built = (None, None)   # (key, build_path result) for the current points
+        self._prof = (None, None)    # (key, profile result) for the current path, marks and limits
+        self.hover = None            # speed label beside the mouse on the path
         families = set(QtGui.QFontDatabase().families())
         self.t = TEXT['ko' if families & set(KOREAN_FONTS) else 'en']
+        # labels drawn on the map (hover speed) use matplotlib's fonts: one with Hangul first
+        from matplotlib import font_manager
+        known = {f.name for f in font_manager.fontManager.ttflist}
+        self.map_font = [f for f in KOREAN_FONTS + ('Noto Sans CJK KR',) if f in known] + ['DejaVu Sans']
         out = os.path.join(WP_DIR, self.out_name)
         if os.path.exists(out):
             self.load(out)
@@ -365,6 +392,7 @@ class Editor:
         line()
         button(BOOST, 'F', lambda: self.start_placing(BOOST), t['boost_tip']).setCheckable(True)
         button(BRAKE, 'B', lambda: self.start_placing(BRAKE), t['brake_tip']).setCheckable(True)
+        button(RESUME, 'E', lambda: self.start_placing(RESUME), t['resume_tip']).setCheckable(True)
         line()
         button('zoom_in', '+', lambda: self.zoom(1 / ZOOM_STEP))
         button('zoom_out', '-', lambda: self.zoom(ZOOM_STEP))
@@ -411,6 +439,7 @@ class Editor:
                 '0': self.fit_view, 'V': self.toggle_speed, 'S': self.smooth,
                 'W': self.keep_off_walls, 'O': self.race_line, 'L': self.straighten,
                 'F': lambda: self.start_placing(BOOST), 'B': lambda: self.start_placing(BRAKE),
+                'E': lambda: self.start_placing(RESUME),
                 'Return': self.save, 'Enter': self.save,
                 'Q': self.win.close, 'Escape': self.escape}
         self.shortcuts = []
@@ -468,15 +497,33 @@ class Editor:
         return [(int(np.argmin(np.linalg.norm(xy - p, axis=1))), kind) for kind, p in self.marks]
 
     def profile(self):
-        """(xy, speeds, zones) as save() would write them, or None while there is no smooth path."""
+        """(xy, speeds, zones, track speeds) as save() would write them (the track speed is the
+        one without marks), or None while there is no smooth path."""
         built = self.build()
         if built is None:
             return None
         xy, a = built[0], self.args
-        v, zone = race_profile(xy, self.closed, a.vmax, a.vmin, a.alat, a.alon,
-                               getattr(a, 'abrake', a.alon), self.mark_indices(xy),
-                               getattr(a, 'aboost', 5.0), getattr(a, 'afull', 4.0))
-        return xy, v, zone
+        limits = (a.vmax, a.vmin, a.alat, a.alon, getattr(a, 'abrake', a.alon),
+                  getattr(a, 'aboost', BOOST_ACCEL), getattr(a, 'afull', BRAKE_DECEL))
+        marks = self.mark_indices(xy)
+        key = (self._built[0], tuple(marks), limits)
+        if self._prof[0] != key:     # every redraw asks; recompute only on a change
+            vmax, vmin, alat, alon, abrake, aboost, afull = limits
+            v, zone = race_profile(xy, self.closed, vmax, vmin, alat, alon, abrake, marks,
+                                   aboost, afull, STOP_DECEL)
+            track = speed_profile(xy, self.closed, vmax, vmin, alat, alon, abrake)
+            self._prof = (key, (xy, v, zone, track))
+        return self._prof[1]
+
+    def open_boost(self):
+        """True when full throttle has nothing after it that ends it (it then speeds up to the
+        next mark, or for ever)."""
+        kinds = [k for _, k in sorted(self.mark_indices(self.build()[0]))] if self.build() else []
+        if BOOST not in kinds:
+            return False
+        if self.closed:
+            return not (set(kinds) & {BRAKE, RESUME})
+        return kinds[-1] == BOOST
 
     def speeds(self):
         """(xy, speeds) as save() would write them, or None while there is no smooth path."""
@@ -560,7 +607,7 @@ class Editor:
         self.overlays = []
         if prof is None:
             return
-        xy, v, zone = prof
+        xy, v, zone, _ = prof
         px = self.to_px(xy)
         for kind in (BOOST, BRAKE):
             for run in _runs_of(zone == kind, self.closed):
@@ -593,10 +640,10 @@ class Editor:
             prv = xy[j - 1] if j > 0 or self.closed else xy[j]
             d = nxt - prv
             angle = np.degrees(np.arctan2(d[1], d[0]))
-            marker = (3, 0, angle - 90) if kind == BOOST else '8'
-            dot, = self.ax.plot([px[j, 0]], [px[j, 1]], marker=marker, ms=16,
-                                mfc=BOOST_COLOR if kind == BOOST else BRAKE_COLOR,
-                                mec='black', mew=1.5, zorder=5)
+            marker = {BOOST: (3, 0, angle - 90), BRAKE: '8', RESUME: 'o'}[kind]
+            color = {BOOST: BOOST_COLOR, BRAKE: BRAKE_COLOR, RESUME: RESUME_COLOR}[kind]
+            dot, = self.ax.plot([px[j, 0]], [px[j, 1]], marker=marker, ms=16 if kind != RESUME else 13,
+                                mfc=color, mec='black', mew=1.5, zorder=5)
             self.overlays.append(dot)
 
     def redraw(self, msg=''):
@@ -611,7 +658,7 @@ class Editor:
         prof = self.profile() if self.show_speed or self.marks else None
         self.draw_overlays(prof)
         if self.show_speed and prof is not None:
-            xy, v, _ = prof
+            xy, v, _, _ = prof
             px = self.to_px(xy)
             a = self.args
             self.path_line = self.ax.scatter(px[:, 0], px[:, 1], c=v, cmap='turbo', s=8,
@@ -626,6 +673,8 @@ class Editor:
             msg = msg or t['sel'].format(m=len(idx) * SPACING)
         else:
             self.sel_line.set_data([], [])
+        if not msg and self.marks and self.open_boost():
+            msg = t['no_end']
         parts = [f'{self.map_name}{" *" if self.dirty else ""}', t['pts'].format(n=len(self.pts)),
                  t['closed'] if self.closed else t['open'],
                  msg or (t['unsaved'] if self.dirty else '')]
@@ -634,8 +683,8 @@ class Editor:
         self.status.setToolTip(f'vmax {a.vmax:.1f} m/s, vmin {a.vmin:.1f} m/s, '
                                f'lateral {a.alat:.2f}, speed-up {a.alon:.2f}, '
                                f'slow-down {getattr(a, "abrake", a.alon):.2f}, '
-                               f'full throttle {getattr(a, "aboost", 5.0):.2f}, '
-                               f'full brake {getattr(a, "afull", 4.0):.2f} m/s²')
+                               f'full throttle {getattr(a, "aboost", BOOST_ACCEL):.2f}, '
+                               f'full brake {getattr(a, "afull", BRAKE_DECEL):.2f} m/s²')
         self.win.setWindowTitle(f'waypoint editor — {self.out_name}{" *" if self.dirty else ""}')
         self.fig.canvas.draw_idle()
 
@@ -669,6 +718,12 @@ class Editor:
     def delete_point(self, i):
         self.straight = _shift_delete(self.straight, i, len(self.pts), self.closed)
         del self.pts[i]
+
+    def keep_start(self, p0):
+        """Turn a closed loop back so it starts at the point nearest p0, where it started before
+        a tool turned it (the CSV keeps its first row)."""
+        if self.closed and self.pts and p0 is not None:
+            self.rotate(self.handle_near(p0, np.inf))
 
     def rotate(self, k):
         """Start a closed loop at point k (the path stays the same)."""
@@ -776,7 +831,9 @@ class Editor:
             if ev.inaxes == self.ax and ev.xdata is not None:
                 self.show_box(w0, self.event_world(ev))
             return
-        if (self.drag is None and self.mark_drag is None) or ev.inaxes != self.ax or ev.xdata is None:
+        if self.drag is None and self.mark_drag is None:
+            return self.show_hover(ev)
+        if ev.inaxes != self.ax or ev.xdata is None:
             return
         if self.drag_from is not None:
             if np.hypot(ev.x - self.drag_from[0], ev.y - self.drag_from[1]) < DRAG_START:
@@ -791,6 +848,30 @@ class Editor:
         else:
             self.pts[self.drag] = self.event_world(ev)
         self.redraw()
+
+    def show_hover(self, ev):
+        """Small label beside the mouse while it is over the path: the planned speed there, the
+        track speed (without marks) and the zone, to place marks by."""
+        hit = self.path_index_at(ev, GRAB_PATH + 4) if ev.inaxes == self.ax else None
+        prof = self.profile() if hit else None
+        if prof is None:
+            if self.hover is not None and self.hover.get_visible():
+                self.hover.set_visible(False)
+                self.fig.canvas.draw_idle()
+            return
+        _, v, zone, track = prof
+        j = hit[0]
+        text = self.t['hover'].format(v=v[j], vt=track[j])
+        if zone[j]:
+            text += ' · ' + self.t['zone_' + zone[j]]
+        if self.hover is None:
+            self.hover = self.ax.annotate('', (0, 0), xytext=(12, 12), textcoords='offset points',
+                                          fontsize=8, zorder=8, fontfamily=self.map_font,
+                                          bbox={'boxstyle': 'round', 'fc': '#fffde7', 'ec': '#444'})
+        self.hover.xy = (ev.xdata, ev.ydata)
+        self.hover.set_text(text)
+        self.hover.set_visible(True)
+        self.fig.canvas.draw_idle()
 
     def on_release(self, ev):
         if self.pan is not None:
@@ -869,7 +950,7 @@ class Editor:
     # ---------- marks ----------
     def set_placing(self, kind):
         self.placing = kind
-        for k in (BOOST, BRAKE):
+        for k in MARKS:
             self.buttons[k].setChecked(k == kind)
 
     def start_placing(self, kind):
@@ -885,14 +966,14 @@ class Editor:
         xy = self.build()[0]
         self.marks.append([kind, tuple(xy[hit[0]])])
         self.set_placing(None)
-        _, v, zone = self.profile()
+        _, v, zone, _ = self.profile()
         j, top = hit[0], 0.0
         for k in range(len(xy)):     # the zone this mark starts
             q = (j + k) % len(xy)
             if k and (not zone[q] or q < j and not self.closed):
                 break
             top = max(top, v[q])
-        self.redraw(t['placed'].format(what=t[kind], v=top))
+        self.redraw(t['no_end'] if self.open_boost() else t['placed'].format(what=t[kind], v=top))
 
     # ---------- path tools (each click is one undoable step) ----------
     def path_stats(self):
@@ -955,11 +1036,11 @@ class Editor:
 
     def scope(self):
         """Gap range [a, b) the tools change: the selection, else the whole path (a closed loop
-        turned so the range does not wrap). None: a whole closed loop without straight lines."""
+        turned so the range does not wrap). None: a whole closed loop without straight lines.
+        'short': there is a selection, but too short to work on."""
         if self.sel is not None:
             ab = self.anchor_selection()
-            if ab is not None:
-                return ab
+            return ab if ab is not None else 'short'     # never the whole path instead
         n = len(self.pts)
         if not self.closed:
             return 0, n - 1
@@ -1006,27 +1087,39 @@ class Editor:
         self.straight = {g + shift if g >= e else g for g in self.straight if not s <= g < e}
         self.pts = self.pts[:s + 1] + [tuple(p) for p in inner] + self.pts[e:]
 
-    def apply_runs(self, fn):
-        """fn(open piece) -> new piece with the same ends, or None, for every stretch of curve in
-        scope(). One undo step; the points change only if a stretch did. Returns how many."""
+    def apply_runs(self, propose, accept):
+        """For every stretch of curve in scope(): propose(open piece) -> new piece with the same
+        ends, or None; the points then change and accept(old piece, rebuilt piece) checks the
+        path as it is really built from them (it can differ from the proposal near the ends);
+        a stretch it refuses goes back. One undo step. Returns how many stretches changed,
+        -1 when the selection is too short."""
         state, dirty = self.snapshot(), self.dirty
+        p0 = self.pts[0] if self.pts else None
         self.history.append(state)
         changed = 0
         sc = self.scope()
-        if sc is not None:
+        if sc == 'short':
+            changed = -1
+        elif sc is not None:
             for s, e in reversed(self.curve_runs(*sc)):
                 sub = self.sub_path(s, e)
-                new = fn(sub) if sub is not None else None
+                new = propose(sub) if sub is not None else None
                 if new is None:
                     continue
+                before = self.snapshot()
                 inner = handles_from_path(np.asarray(new), closed=False)[0][1:-1]
                 self.splice(s, e, inner)
+                rebuilt = self.sub_path(s, s + len(inner) + 1)
+                if rebuilt is None or not accept(sub, rebuilt):
+                    self.restore(before)
+                    continue
                 changed += 1
-        if not changed:
+        if changed <= 0:
             self.history.pop()
             self.restore(state)
             self.dirty = dirty
         else:
+            self.keep_start(p0)
             self.dirty = True
         return changed
 
@@ -1047,25 +1140,37 @@ class Editor:
             return self.smooth_whole(before)
         ks = []
 
+        def fits(old, new):
+            """Gentler and no closer to a wall than before (inside the clearance target)."""
+            if len(new) < 5 or not np.isfinite(new).all():
+                return None
+            k0 = float(curvature(old, False)[1:-1].max())
+            k1 = float(curvature(new, False)[1:-1].max())
+            gap_old = self.clear_pts(old)[cKDTree(old).query(new)[1]]
+            ok = k1 < k0 - 1e-4 and (self.clear_pts(new) >= np.minimum(target, gap_old) - 0.01).all()
+            return (k0, k1) if ok else None
+
         def ease(sub):
-            k0 = float(curvature(sub, False)[1:-1].max())
-            gap_old = self.clear_pts(sub)
             deviation = SMOOTH_DEVIATION
             for _ in range(SMOOTH_TRIES):
                 try:
                     new = smoothing_fit(sub, False, deviation, pinned=3)
                 except (ValueError, TypeError):
                     new = None
-                if new is not None and len(new) > 4 and np.isfinite(new).all():
-                    k1 = float(curvature(new, False)[1:-1].max())
-                    near = np.array([np.argmin(np.linalg.norm(sub - p, axis=1)) for p in new])
-                    if k1 < k0 - 1e-4 and (self.clear_pts(new)
-                                           >= np.minimum(target, gap_old[near]) - 0.01).all():
-                        ks.append((k0, k1))
-                        return new
+                if new is not None and fits(sub, new):
+                    return new
                 deviation /= 2
             return None
-        if not self.apply_runs(ease):
+
+        def accept(old, rebuilt):
+            k = fits(old, rebuilt)
+            if k:
+                ks.append(k)
+            return bool(k)
+        done = self.apply_runs(ease, accept)
+        if done < 0:
+            return self.redraw(t['sel_short'])
+        if not done:
             return self.redraw(t['smooth_none'])
         after = self.path_stats() or before
         self.redraw(t['smoothed'].format(k0=max(k for k, _ in ks), k1=max(k for _, k in ks),
@@ -1102,8 +1207,10 @@ class Editor:
         current path xy0 is driven at (each new point takes the speed of the nearest old one)."""
         a = self.args
 
+        tree = cKDTree(xy0)
+
         def margins(xy):
-            near = np.array([np.argmin(np.linalg.norm(xy0 - p, axis=1)) for p in xy])
+            near = tree.query(xy)[1]
             return wall_margins(xy, closed, v0[near], base, getattr(a, 'ld_min', 0.6),
                                 getattr(a, 'ld_gain', 0.4), getattr(a, 'slip', 0.03),
                                 getattr(a, 'margin_cap', 0.0))
@@ -1118,7 +1225,7 @@ class Editor:
             return self.redraw(t['need'].format(n=3 if self.closed else 2))
         self.need_clearance()
         before = self.path_stats()
-        xy0, v0, _ = prof
+        xy0, v0, _, _ = prof
         base = getattr(self.args, 'race_clearance', 0.25)
         ks = []
         if self.sel is None and self.closed and not self.straight:
@@ -1130,16 +1237,25 @@ class Editor:
             self.pts = [tuple(p) for p in handles_from_path(new, True)[0]]
             ks.append((k0.max(), k1.max()))
         else:
-            def straighten_out(sub):
-                new = racing_line(sub, False, self.clear_pts, self.margins_fn(False, base, xy0, v0))
+            def gentler(old, new):
                 if len(new) < 5 or not np.isfinite(new).all():
                     return None
-                k0, k1 = curvature(sub, False)[1:-1], curvature(new, False)[1:-1]
-                if (k1 ** 2).sum() > 0.99 * (k0 ** 2).sum():
-                    return None
-                ks.append((k0.max(), k1.max()))
-                return new
-            if not self.apply_runs(straighten_out):
+                k0, k1 = curvature(old, False)[1:-1], curvature(new, False)[1:-1]
+                return (k0.max(), k1.max()) if (k1 ** 2).sum() <= 0.99 * (k0 ** 2).sum() else None
+
+            def straighten_out(sub):
+                new = racing_line(sub, False, self.clear_pts, self.margins_fn(False, base, xy0, v0))
+                return new if gentler(sub, new) else None
+
+            def accept(old, rebuilt):
+                k = gentler(old, rebuilt)
+                if k:
+                    ks.append(k)
+                return bool(k)
+            done = self.apply_runs(straighten_out, accept)
+            if done < 0:
+                return self.redraw(t['sel_short'])
+            if not done:
                 return self.redraw(t['race_none'])
         after = self.path_stats() or before
         self.redraw(t['raced'].format(k0=max(k for k, _ in ks), k1=max(k for _, k in ks),
@@ -1151,17 +1267,19 @@ class Editor:
         if self.sel is None:
             return self.redraw(t['need_sel'])
         state, dirty = self.snapshot(), self.dirty
+        p0 = self.pts[0] if self.pts else None
         self.history.append(state)
         ab = self.anchor_selection()
         if ab is None or self.closed and len(self.pts) - (ab[1] - ab[0] - 1) < 3:
             self.history.pop()
             self.restore(state)
             self.dirty = dirty
-            return self.redraw(t['need_sel'])
+            return self.redraw(t['sel_short'])
         a, b = ab
         length = float(np.linalg.norm(np.subtract(self.pts[a], self.pts[b % len(self.pts)])))
         self.splice(a, b, [])
         self.straight.add(a)
+        self.keep_start(p0)
         self.sel = None
         self.dirty = True
         self.redraw(t['straightened'].format(m=length))
@@ -1174,7 +1292,7 @@ class Editor:
         prof = self.profile() if cap > 0 else None
         if prof is None:
             return [base] * len(self.pts)
-        xy, v, _ = prof
+        xy, v, _, _ = prof
         left, right = wall_margins(xy, self.closed, v, base, getattr(a, 'ld_min', 0.6),
                                    getattr(a, 'ld_gain', 0.4), getattr(a, 'slip', 0.03), cap)
         nrm = left_normals(xy, self.closed)
@@ -1257,14 +1375,14 @@ class Editor:
                 self.pts = [tuple(map(float, p)) for p in kept['points']]
                 self.closed = bool(kept['closed'])
                 self.straight = {int(g) for g in kept['straight']}
-                self.marks = [[k, tuple(map(float, p))] for k, p in kept['marks'] if k in (BOOST, BRAKE)]
+                self.marks = [[k, tuple(map(float, p))] for k, p in kept['marks'] if k in MARKS]
                 return
         except (OSError, ValueError, KeyError, TypeError):
             pass
         if len(xy) >= 2:
             handles, self.closed = handles_from_path(xy)
             self.pts = [tuple(p) for p in handles]
-        self.marks = [[k, tuple(xy[i])] for i, k in read_marks(out) if k in (BOOST, BRAKE) and i < len(xy)]
+        self.marks = [[k, tuple(xy[i])] for i, k in read_marks(out) if k in MARKS and i < len(xy)]
 
     def save(self):
         t = self.t
@@ -1278,7 +1396,7 @@ class Editor:
             self.redraw(t['same_spot'])
             return
         xy, length, _ = built
-        _, v, zone = self.profile()
+        _, v, zone, _ = self.profile()
         mark = [''] * len(xy)
         for j, kind in self.mark_indices(xy):
             mark[j] = kind
@@ -1297,6 +1415,8 @@ class Editor:
         store.sync()
         self.dirty = False
         msg = t['saved'].format(n=len(xy), m=length, v0=v.min(), v1=v.max())
+        if self.open_boost():
+            msg += '  ·  ' + t['no_end']
         # the preview PNG always shows the speeds, and they stay on after saving
         self.show_speed = True
         self.buttons['speed'].setChecked(True)
@@ -1366,11 +1486,12 @@ def main():
                    help='slow-down before corners [m/s^2]; keep below pure_pursuit stop_decel')
     p.add_argument('--wall_clearance', type=float, default=0.40,
                    help='keep-off-walls tool: path to wall distance [m] (half car width 0.21 + margin)')
-    p.add_argument('--aboost', type=float, default=5.0,
-                   help='speed-up from a full-throttle mark [m/s^2]')
-    p.add_argument('--afull', type=float, default=4.0,
-                   help='braking in full-throttle / full-brake zones [m/s^2]; at most what the '
-                        'tyres hold (pure_pursuit brake_decel)')
+    p.add_argument('--aboost', type=float, default=BOOST_ACCEL,
+                   help='speed-up from a full-throttle mark [m/s^2]; keep it equal to pure_pursuit '
+                        'boost_accel (both default to path_tools.BOOST_ACCEL)')
+    p.add_argument('--afull', type=float, default=BRAKE_DECEL,
+                   help='braking from a full-brake mark [m/s^2]; keep it equal to pure_pursuit '
+                        'brake_decel (both default to path_tools.BRAKE_DECEL)')
     p.add_argument('--race_clearance', type=float, default=0.25,
                    help='racing line: path to wall distance [m] (half car width 0.135 + margin)')
     p.add_argument('--margin_cap', type=float, default=0.2,
