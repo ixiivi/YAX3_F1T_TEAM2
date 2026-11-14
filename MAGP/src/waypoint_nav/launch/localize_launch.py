@@ -6,13 +6,18 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
-    amcl_yaml = os.path.join(get_package_share_directory('waypoint_nav'), 'config', 'amcl.yaml')
+    config = os.path.join(get_package_share_directory('waypoint_nav'), 'config')
+    # amcl:=light uses config/amcl_light.yaml (fewer particles and beams, less CPU)
+    amcl_arg = DeclareLaunchArgument('amcl', default_value='normal', description='normal | light')
+    amcl_yaml = PythonExpression(["'" + os.path.join(config, 'amcl_light.yaml') + "' if '",
+                                  LaunchConfiguration('amcl'), "' == 'light' else '" +
+                                  os.path.join(config, 'amcl.yaml') + "'"])
     map_arg = DeclareLaunchArgument(
         'map', description='map .yaml saved by map_saver_cli (absolute path)')
     # start pose in the map frame; refine it with RViz "2D Pose Estimate"
@@ -22,7 +27,7 @@ def generate_launch_description():
     auto_arg = DeclareLaunchArgument(
         'auto', default_value='true', description='find the start pose by scan matching')
     return LaunchDescription([
-        map_arg, auto_arg, *init_args,
+        map_arg, auto_arg, amcl_arg, *init_args,
         Node(package='nav2_map_server', executable='map_server', name='map_server',
              output='screen',
              parameters=[{'yaml_filename': LaunchConfiguration('map')}]),

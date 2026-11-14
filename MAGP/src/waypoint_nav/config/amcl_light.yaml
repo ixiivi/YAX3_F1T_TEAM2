@@ -1,0 +1,35 @@
+# LIGHT variant of amcl.yaml (2026-11-15): fewer particles and beams, for less CPU while driving
+# fast (global search took 9-24 s driving vs 4-5 s idle at the venue). Everything else = amcl.yaml.
+# Based on the legacy race_stack amcl.yaml. That car used gyro odometry (/odom_imu);
+# this one only has VESC wheel odometry, so the motion noise alphas are larger.
+amcl:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: "base_link"
+    odom_frame_id: "odom"
+    global_frame_id: "map"
+    scan_topic: "scan"
+    min_particles: 500
+    max_particles: 1000   # amcl.yaml: 2000
+    laser_model_type: "likelihood_field"
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 10.0      # UST-10LX
+    laser_min_range: 0.06
+    max_beams: 90         # amcl.yaml: 180
+    robot_model_type: "nav2_amcl::DifferentialMotionModel"
+    alpha1: 0.15   # rotation -> rotation (back to 0.15: 0.08 lagged the heading in corners, 2026-11-14)
+    alpha2: 0.10   # translation -> rotation
+    alpha3: 0.08   # translation -> translation (was 0.15; 0.03 would not relocalize, 2026-11-14)
+    alpha4: 0.10   # rotation -> translation
+    update_min_d: 0.025
+    update_min_a: 0.03
+    resample_interval: 1
+    transform_tolerance: 0.5
+    recovery_alpha_slow: 0.0
+    recovery_alpha_fast: 0.0
+    always_reset_initial_pose: false
+    # Without an initial pose AMCL publishes no map frame, so RViz shows nothing to click on.
+    # Overridden by the x/y/yaw args of localize_launch.py; refine with RViz "2D Pose Estimate".
+    set_initial_pose: true
+    initial_pose: {x: 0.0, y: 0.0, z: 0.0, yaw: 0.0}
+    tf_broadcast: true

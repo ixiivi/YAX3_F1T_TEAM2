@@ -15,9 +15,9 @@ amcl:
     laser_min_range: 0.06
     max_beams: 180
     robot_model_type: "nav2_amcl::DifferentialMotionModel"
-    alpha1: 0.15   # rotation -> rotation
+    alpha1: 0.15   # rotation -> rotation (back to 0.15: 0.08 lagged the heading in corners, 2026-11-14)
     alpha2: 0.10   # translation -> rotation
-    alpha3: 0.15   # translation -> translation
+    alpha3: 0.08   # translation -> translation (was 0.15; 0.03 would not relocalize, 2026-11-14)
     alpha4: 0.10   # rotation -> translation
     update_min_d: 0.025
     update_min_a: 0.03

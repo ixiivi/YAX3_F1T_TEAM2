@@ -116,3 +116,13 @@ def test_full_throttle_and_full_brake_zones_change_only_the_ramp_rates(bare_pp, 
     write_csv(tmp_path / 'b.csv', xy, np.ones(5), ['', 'boost', 'boost', 'brake', ''],
               ['', 'boost', '', '', ''])
     assert list(load_zones(tmp_path / 'b.csv')) == ['', 'boost', 'boost', 'brake', '']
+
+
+def test_global_pose_is_carried_forward_by_odometry():
+    from waypoint_nav.global_localize import carry_forward
+    # found at (1, 2) facing +y; odometry says the car then drove 2 m straight on and turned 90 deg
+    x, y, yaw = carry_forward((1.0, 2.0, math.pi / 2), (0.0, 0.0, 0.0), (2.0, 0.0, math.pi / 2))
+    assert (x, y) == pytest.approx((1.0, 4.0)) and yaw == pytest.approx(math.pi)
+    # odom frame rotated against the map: same motion in the car frame, same answer
+    x, y, yaw = carry_forward((1.0, 2.0, math.pi / 2), (5.0, 5.0, math.pi), (3.0, 5.0, -math.pi / 2))
+    assert (x, y) == pytest.approx((1.0, 4.0)) and yaw == pytest.approx(math.pi)

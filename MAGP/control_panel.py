@@ -613,18 +613,17 @@ class Panel(QtWidgets.QWidget):
         self.stop_btn = self._button('정지 (감속)', lambda: self.ros.pp('stop'), '#f9a825')
         g.addWidget(self.go_btn, 3, 0, 1, 2)
         g.addWidget(self.stop_btn, 3, 2, 1, 2)
-        self.avoid_cb = nofocus(QtWidgets.QCheckBox('장애물 우회', checked=True))
-        self.reverse_cb = nofocus(QtWidgets.QCheckBox('벽에 박으면 후진', checked=True))
-        self.reverse_cb.setToolTip('앞바퀴나 범퍼가 벽에 닿으면 지나온 길로 후진해요.\n'
-                                    '끄면 충돌 감지도 꺼져요. 위치가 틀어지면 후진 없이 제자리에서 다시 잡아요.')
-        g.addWidget(self.avoid_cb, 4, 0, 1, 4)
-        g.addWidget(self.reverse_cb, 5, 0, 1, 4)
+        # driving options live in a settings popup (one gear button instead of a column of boxes)
+        self.settings_dlg = self._settings_dialog()
+        self.settings_btn = self._button('\u2699\ufe0f 주행 설정', self.settings_dlg.show)
+        self.settings_btn.setToolTip('장애물 우회, 후진, 위치 찾는 동안 주행, 위치 보정, AMCL 가볍게')
+        g.addWidget(self.settings_btn, 4, 0, 1, 4)
         # the node's own status lines are in the 자율주행 log tab; here only the last event
         self.event_label = QtWidgets.QLabel('')
         self.event_label.setWordWrap(True)
         self.event_label.setStyleSheet('color:#e65100; font-weight:bold')
-        g.addWidget(self.event_label, 6, 0, 1, 4)
-        g.setRowStretch(7, 1)
+        g.addWidget(self.event_label, 5, 0, 1, 4)
+        g.setRowStretch(6, 1)
         return box
 
     def _drive_row(self):
@@ -740,6 +739,80 @@ class Panel(QtWidgets.QWidget):
     def warn(self, text):
         QtWidgets.QMessageBox.warning(self, 'F1TENTH 제어판', text)
 
+    def _settings_dialog(self):
+        """Popup with the driving options. Autonomy options apply at once while it runs
+        (ros2 param set); 'AMCL 가볍게' applies the next time 위치 추정 (AMCL) starts."""
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle('주행 설정')
+        lay = QtWidgets.QGridLayout(dlg)
+        self.avoid_cb = QtWidgets.QCheckBox('장애물 우회', checked=True)
+        self.avoid_cb.setToolTip('경로 위 장애물을 옆으로 비켜 가요. 끄면 AEB만 막아 줘요.')
+        self.reverse_cb = QtWidgets.QCheckBox('벽에 박으면 후진', checked=True)
+        self.reverse_cb.setToolTip('앞바퀴나 범퍼가 벽에 닿으면 지나온 길로 후진해요.\n'
+                                   '끄면 충돌 감지도 꺼져요. 위치가 틀어지면 후진 없이 제자리에서 다시 잡아요.')
+        self.search_drive_cb = QtWidgets.QCheckBox('위치 찾는 동안 계속 주행', checked=True)
+        self.search_drive_cb.setToolTip('위치를 다시 찾는 동안 멈추지 않고 라이다로 본 가장 넓은 빈 곳 쪽으로\n'
+                                        '천천히 굴러가요 (AEB는 그대로). 끄면 예전처럼 서서 찾아요.')
+        self.search_speed = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=2.0, singleStep=0.1,
+                                                     value=1.0, suffix=' m/s')
+        self.search_speed.setToolTip('위치 찾는 동안 굴러가는 속도')
+        self.drift_cb = QtWidgets.QCheckBox('주행 중 위치 보정 (drift fix)', checked=True)
+        self.drift_cb.setToolTip('맵 일치도가 낮으면 근처를 스캔 매칭으로 찾아 AMCL을 바로잡아요.\n'
+                                 '끄면 AMCL만 써요. 위치를 잃었을 때 다시 찾는 기능은 그대로예요.')
+        self.gpu_cb = QtWidgets.QCheckBox('위치 탐색에 GPU 사용', checked=False)
+        self.gpu_cb.setToolTip('위치를 다시 찾을 때 후보 위치 계산을 GPU로 해요 (CPU와 같은 결과, 3~4배 빠름).\n'
+                               '자율주행 준비 / 위치 찾기를 다시 켤 때 적용돼요.')
+        self.amcl_light_cb = QtWidgets.QCheckBox('AMCL 가볍게 (입자 1000, 레이저 90)', checked=False)
+        self.amcl_light_cb.setToolTip('AMCL 계산량을 줄여요 (기본: 입자 2000, 레이저 180).\n'
+                                      '위치 추정(AMCL)을 다시 켤 때 적용돼요.')
+        rows = [(self.avoid_cb, None), (self.reverse_cb, None),
+                (self.search_drive_cb, self.search_speed), (self.drift_cb, None),
+                (self.gpu_cb, None), (self.amcl_light_cb, None)]
+        for r, (w, extra) in enumerate(rows):
+            lay.addWidget(w, r, 0, 1, 1 if extra else 2)
+            if extra:
+                lay.addWidget(extra, r, 1)
+        note = QtWidgets.QLabel('위 네 가지는 주행 중에도 바로 적용돼요.\n'
+                                'GPU는 자율주행을, AMCL 가볍게는 위치 추정을 다시 켤 때 적용돼요.')
+        note.setStyleSheet('color: gray')
+        lay.addWidget(note, len(rows), 0, 1, 2)
+        close = QtWidgets.QPushButton('닫기')
+        close.clicked.connect(dlg.hide)
+        lay.addWidget(close, len(rows) + 1, 1)
+        for cb, name in ((self.avoid_cb, 'avoid_enabled'), (self.reverse_cb, 'reverse_enabled'),
+                         (self.drift_cb, 'drift_fix_enabled')):
+            cb.toggled.connect(lambda on, n=name, c=cb: self.set_pp_param(n, 'true' if on else 'false',
+                                                                          c.text()))
+        self.search_drive_cb.toggled.connect(self.apply_search_drive)
+        self.search_speed.valueChanged.connect(self.apply_search_drive)
+        self.amcl_light_cb.toggled.connect(lambda on: self.event_label.setText(
+            f'AMCL {"가볍게" if on else "기본"}: 위치 추정을 다시 켜면 적용돼요'))
+        return dlg
+
+    def match_device(self):
+        return 'cuda' if self.gpu_cb.isChecked() else 'cpu'
+
+    def set_pp_param(self, name, value, label):
+        """Hand one changed option to the running autonomy (ros2 param set, in the background)."""
+        if not self.procs['pp'].running():
+            return
+        subprocess.Popen(['ros2', 'param', 'set', '/pure_pursuit', name, value],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.event_label.setText(f'{label}: {"켬" if value == "true" else "끔" if value == "false" else value}')
+
+    def search_drive_value(self):
+        """pure_pursuit search_drive_speed from the panel: 0 = stand still while relocalizing."""
+        self.search_speed.setEnabled(self.search_drive_cb.isChecked())
+        return self.search_speed.value() if self.search_drive_cb.isChecked() else 0.0
+
+    def apply_search_drive(self, *_):
+        """Hand a changed setting to the running autonomy at once (ros2 param set, background)."""
+        v = self.search_drive_value()
+        self.set_pp_param('search_drive_speed', f'{v:.2f}',
+                          '위치 찾는 동안 주행' + ('' if v == 0 else f' {v:.1f} m/s'))
+        if v == 0 and self.procs['pp'].running():
+            self.event_label.setText('위치 찾는 동안 주행: 끔')
+
     def toggle(self, key):
         pr = self.procs[key]
         if pr.running():
@@ -767,14 +840,18 @@ class Panel(QtWidgets.QWidget):
             # the gamepad has its own button: it would otherwise hold /teleop whenever connected
             'bringup': 'ros2 launch f1tenth_stack bringup_launch.py use_joy:=false',
             'slam': f'ros2 launch slam_toolbox online_async_launch.py slam_params_file:={SLAM_PARAMS}',
-            'localize': f'ros2 launch waypoint_nav localize_launch.py map:={self.selected_map()}',
+            'localize': (f'ros2 launch waypoint_nav localize_launch.py map:={self.selected_map()} '
+                         f'amcl:={"light" if self.amcl_light_cb.isChecked() else "normal"}'),
             # QT_FONT_DPI: the desktop text scale would crowd the RViz toolbar
             'rviz': f'env QT_FONT_DPI=60 rviz2 -d {WS}/f1tenth.rviz',
             'pp': ('ros2 run waypoint_nav pure_pursuit --ros-args '
                    f'-p waypoint_file:={self.wp_cb.currentData()} -p max_speed:={self.vmax.value():.2f} '
                    f'-p map_yaml:={self.selected_map()} '
                    f'-p avoid_enabled:={str(self.avoid_cb.isChecked()).lower()} '
-                   f'-p reverse_enabled:={str(self.reverse_cb.isChecked()).lower()}'),
+                   f'-p reverse_enabled:={str(self.reverse_cb.isChecked()).lower()} '
+                   f'-p search_drive_speed:={self.search_drive_value():.2f} '
+                   f'-p drift_fix_enabled:={str(self.drift_cb.isChecked()).lower()} '
+                   f'-p match_device:={self.match_device()}'),
         }
         if key == 'localize':
             self.loc_map = self.selected_map()
@@ -823,7 +900,9 @@ class Panel(QtWidgets.QWidget):
     def edit_waypoints(self):
         if not self.selected_map():
             return self.warn('맵이 없어요.')
-        self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()}')
+        # the editor plans with this panel's max speed, so its speeds and brake points match the car
+        self.procs['editor'].start(f'ros2 run waypoint_nav waypoint_editor {self.selected_map()} '
+                                   f'--vmax {self.vmax.value():.2f}')
         self.tabs.setCurrentWidget(self.procs['editor'].log)
 
     def delete_map(self):
@@ -869,7 +948,8 @@ class Panel(QtWidgets.QWidget):
         if self.map_mismatch():
             return
         self.procs['tool'].start(
-            f'ros2 run waypoint_nav global_localize --ros-args -p map:={self.selected_map()}')
+            f'ros2 run waypoint_nav global_localize --ros-args -p map:={self.selected_map()} '
+            f'-p match_device:={self.match_device()}')
         self.tabs.setCurrentWidget(self.procs['tool'].log)
 
     def go(self):

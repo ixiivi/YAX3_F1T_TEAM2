@@ -13,6 +13,16 @@ Which column answers what:
   ax, ay, wz                      VESC IMU (sensors/imu/raw) forward / sideways acceleration and
                                   yaw rate, as the VESC sends them (g and deg/s, unconverted):
                                   grip used in corners, how hard it really brakes
+  pose_age, no_pose_why            how old the map pose is; why it was missing (NO POSE)
+  odom_*, map_odom_*              wheel/IMU pose and AMCL's correction on top: a jump in
+                                  map_odom with smooth odom = AMCL (or a drift fix) moved it
+  amcl_age, amcl_std(_deg)        time since AMCL's last pose and its uncertainty
+  fix_cm, fix_deg                 our drift fix applied in this row (scan matcher)
+  loop_ms, scan_age               control step compute time; LiDAR scan delay [s]
+  v_wheel, motor_a, duty, batt_v  VESC: wheel speed from erpm vs v_odom (spin / lock), motor
+                                  current, duty, battery voltage
+  v_limit                         what set the speed: csv / accel / decel (:zone) / turn /
+                                  return / escape / AEB / NO / TRAILING ... (a stop's reason)
 """
 import csv
 import os
@@ -21,7 +31,10 @@ import time
 FIELDS = ('t', 'x', 'y', 'yaw', 'i', 'off_path', 'mode', 'running', 'status',
           'v_want', 'cmd_v', 'v_plan', 'zone', 'v_odom', 'ax', 'ay', 'wz', 'cmd_steer', 'offset', 'goal', 'n_obs', 'n_clusters', 'skew', 'n_free', 'n_cand',
           'fit', 'corrections', 'attempts', 'n_contact', 'n_contact_front', 'scan_change',
-          'frozen_s', 'event')
+          'frozen_s', 'pose_age', 'no_pose_why', 'odom_x', 'odom_y', 'odom_yaw',
+          'map_odom_x', 'map_odom_y', 'map_odom_yaw', 'amcl_age', 'amcl_std', 'amcl_std_deg',
+          'fix_cm', 'fix_deg', 'loop_ms', 'scan_age', 'v_wheel', 'motor_a', 'duty', 'batt_v',
+          'v_limit', 'event')
 
 
 class RunLog:

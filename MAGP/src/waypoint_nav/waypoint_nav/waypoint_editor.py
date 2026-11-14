@@ -79,6 +79,63 @@ FREE_MIN = 250      # map pixels at least this bright are free space (254); wall
 SMOOTH_DEVIATION = 0.05  # [m] how far one smoothing click may move the path, halved until it fits
 SMOOTH_TRIES = 5         # halvings before giving up (0.05 m down to about 3 mm)
 WALL_PASSES = 12    # wall clearance: rounds of pushing points out and adding points where needed
+# hover help for the icon bar (Korean): what each button does and how to use it with the mouse
+HELP_KO = {
+    'undo': '마지막 작업 하나를 되돌려요.<br>'
+            '점 추가·이동·삭제, 곡률 줄이기, 벽 띄우기, 레이싱 라인, 직선, 마크까지 모두 한 단계씩.<br>'
+            '여러 번 누르면 계속 뒤로 가요.',
+    'loop': '<b>닫힌 경로</b>(마지막 점이 첫 점으로 이어지는 한 바퀴) ↔ '
+            '<b>열린 경로</b>(출발에서 도착까지, 끝에서 멈춤) 전환.<br>트랙을 도는 경로는 닫힌 경로로 두세요.',
+    'clear': '모든 점을 지워요. 새 경로를 처음부터 그릴 때 써요.<br>실수로 눌렀으면 <b>Z</b>로 복구돼요.',
+    'smooth': '누를 때마다 커브를 조금씩 완만하게 해요 (한 번에 최대 약 5 cm 이동).<br>'
+              '벽에 더 가까워지거나 곡률이 오히려 커지면 바꾸지 않아요.<br>'
+              '상태 줄에 최대 곡률과 커브 최저 속도의 변화가 나와요. 원하는 만큼 여러 번 누르세요.',
+    'walls': '벽에서 <b>{d:.2f} m</b>보다 가까운 점을 벽 반대쪽으로 밀어요.<br>'
+             '점과 점 사이 곡선이 벽에 닿으면 그 자리에 점을 추가해서 함께 밀어요.<br>'
+             '좁은 통로에서는 한가운데까지만 옮겨요. 회색(미확인) 영역도 벽으로 봐요.',
+    'race': '<b>아웃-인-아웃 레이싱 라인</b>: 벽에서 {r:.2f} m 여유 안에서 곡률이 가장 작은 선으로 바꿔요.<br>'
+            '<b>사용법</b>: 지도의 빈 곳을 드래그해 구간을 선택한 뒤 누르면 그 구간만 (양 끝은 고정).<br>'
+            '선택 없이 누르면 경로 전체.',
+    'straight': '선택한 구간을 <b>직선 하나</b>로 바꿔요.<br>'
+                '<b>사용법</b>: 지도의 빈 곳을 드래그해 구간 선택 → 이 버튼 (또는 L).<br>'
+                '직선의 양 끝 점을 끌면 직선이 따라 움직여요. 직선 위를 <b>오른쪽 클릭</b>하면 직선이 풀려요.',
+    'boost': '<b>풀악셀 마크</b>: 여기부터 다음 마크까지 곡선 속도 제한 없이 최대로 가속해요.<br>'
+             '<b>사용법</b>: 버튼(또는 F)을 누른 뒤 경로 위를 클릭해서 놓아요. 취소는 Esc.<br>'
+             '뒤에 <b>풀브레이크</b>나 <b>트랙 속도 복귀</b> 마크를 꼭 놓으세요.<br>'
+             '놓은 마크는 끌면 경로를 따라 움직이고, <b>오른쪽 클릭</b>하면 지워져요.',
+    'brake': '<b>풀브레이크 마크</b>: 여기부터 트랙 속도까지 최대로 감속해요.<br>'
+             '<b>사용법</b>: 버튼(또는 B)을 누른 뒤 경로 위를 클릭. 취소는 Esc.<br>'
+             '끌어서 위치 조정, <b>오른쪽 클릭</b>으로 삭제.',
+    'resume': '<b>트랙 속도 복귀 마크</b>: 풀악셀을 끝내고 원래 트랙 속도로 돌아가요 (더 느려야 하면 평소처럼 감속).<br>'
+              '<b>사용법</b>: 버튼(또는 E)을 누른 뒤 경로 위를 클릭. 취소는 Esc.<br>'
+              '끌어서 위치 조정, <b>오른쪽 클릭</b>으로 삭제.',
+    'zoom_in': '화면 가운데를 기준으로 확대해요.<br>마우스 <b>휠</b>을 쓰면 마우스 위치를 기준으로 확대돼요.',
+    'zoom_out': '화면 가운데를 기준으로 축소해요.<br>마우스 <b>휠</b>을 쓰면 마우스 위치를 기준으로 축소돼요.',
+    'fit': '맵 전체가 보이게 돌아가요.',
+    'speed': '경로를 <b>저장될 속도</b>로 색칠해요: 파랑 = 느림, 빨강 = 빠름.<br>'
+             '켜져 있으면 버튼이 눌린 모양이고, 점을 고칠 때마다 바로 다시 계산해요.<br>'
+             '경로 위에 마우스를 올리면 그 지점의 속도가 작은 상자로 나와요.',
+    'save': '경로를 부드럽게 만들고 속도를 계산해서 <b>CSV</b>와 미리보기 <b>PNG</b>로 저장해요.<br>'
+            '같은 이름의 파일은 덮어써요. 아래의 횡가속도·가속 값도 이 경로에 함께 기억돼요.',
+    'quit': '편집기를 닫아요. <b>저장 안 한 변경은 사라져요.</b>',
+    'alat': '<b>횡가속도</b> [m/s²]: 커브를 도는 속도의 한계.<br>'
+            '높일수록 커브를 빨리 돌지만 타이어가 미끄러질 수 있어요. 조금씩 올려 가며 시험하세요.<br>'
+            '▲▼는 0.25씩. 바꾸면 속도 색이 자동으로 켜지고, 저장하면 이 경로에 기억돼요.',
+    'alon': '<b>가속</b> [m/s²]: 커브를 빠져나오며 속도를 올리는 정도.<br>'
+            '자율주행의 accel 값보다 크면 차가 따라가지 못해요.<br>'
+            '▲▼는 0.25씩. 바꾸면 속도 색이 자동으로 켜지고, 저장하면 이 경로에 기억돼요.',
+    'mouse': '<b>지도 위 마우스</b><br>'
+             '빈 곳 <b>클릭</b>: 경로 맨 끝에 점 추가 (A 키: 마우스 위치에 추가, 원격 접속용)<br>'
+             '점을 <b>드래그</b>: 점 이동 (3픽셀 이상 움직여야 이동으로 쳐요)<br>'
+             '경로 선을 <b>드래그</b>: 그 자리에 점을 끼워 넣고 바로 이동<br>'
+             '빈 곳을 <b>드래그</b>: 사각형으로 구간 선택 (레이싱 라인·직선에 사용, Esc로 해제)<br>'
+             '<b>오른쪽 클릭</b>: 마우스 아래의 점 → 마크 → 직선 순서로 하나 삭제<br>'
+             '<b>오른쪽 드래그</b>: 화면 이동<br>'
+             '<b>휠</b>: 마우스 위치를 기준으로 확대/축소<br>'
+             '경로 위에 <b>올려 두기</b>: 그 지점의 계획 속도 표시',
+}
+
+
 TEXT = {
     'ko': {'undo': '되돌리기', 'loop': '닫힌 경로 / 열린 경로',
            'loop_tip': '닫힌 경로: 마지막 점이 첫 점으로 이어지는 한 바퀴',
@@ -94,6 +151,7 @@ TEXT = {
            'alon': '가속', 'alon_tip': '커브를 빠져나오며 속도를 올리는 정도 (자율주행 accel 이하로)',
            'speed': '곡률별 속도 색', 'speed_tip': '파랑 = 느림, 빨강 = 빠름. 점을 옮기면 바로 다시 계산',
            'speed_range': '속도 {v0:.2f}~{v1:.2f} m/s',
+           'cap': '최고 속도 {v:.1f} m/s, 제어판 값',
            'save': '저장', 'save_tip': '경로를 부드럽게 만들고 속도를 계산해 CSV와 미리보기 PNG로 저장',
            'quit': '종료', 'quit_tip': '저장 안 한 변경은 사라짐',
            'help': '클릭: 점 추가   점 드래그: 이동   경로 드래그: 점 끼우기   빈 곳 드래그: 구간 선택   '
@@ -131,6 +189,7 @@ TEXT = {
            'alon': 'speed-up', 'alon_tip': 'how fast speed rises out of corners (at most pure_pursuit accel)',
            'speed': 'Speed colours', 'speed_tip': 'blue = slow, red = fast; follows every edit',
            'speed_range': 'speed {v0:.2f}..{v1:.2f} m/s',
+           'cap': 'top speed {v:.1f} m/s, from the panel',
            'save': 'Save', 'save_tip': 'smooth the path, compute speeds, write CSV and preview PNG',
            'quit': 'Quit', 'quit_tip': 'unsaved changes are lost',
            'help': 'click: add   drag point: move   drag path: insert   drag empty map: select   '
@@ -331,7 +390,11 @@ class Editor:
         # labels drawn on the map (hover speed) use matplotlib's fonts: one with Hangul first
         from matplotlib import font_manager
         known = {f.name for f in font_manager.fontManager.ttflist}
-        self.map_font = [f for f in KOREAN_FONTS + ('Noto Sans CJK KR',) if f in known] + ['DejaVu Sans']
+        # matplotlib names the Noto CJK collection after its first face, 'Noto Sans CJK JP' (it has
+        # all Hangul too): without it map labels fall back to DejaVu Sans and Hangul shows as boxes
+        self.map_font = [f for f in KOREAN_FONTS + ('Noto Sans CJK KR', 'Noto Sans CJK JP')
+                         if f in known] + ['DejaVu Sans']
+        matplotlib.rcParams['font.family'] = self.map_font   # every label on the map, not only some
         out = os.path.join(WP_DIR, self.out_name)
         if os.path.exists(out):
             self.load(out)
@@ -370,6 +433,9 @@ class Editor:
             b.setIcon(make_icon(key, QtCore, QtGui, draw=_icon_lines_wp))
             b.setIconSize(QtCore.QSize(BUTTON - 14, BUTTON - 14))
             b.setFixedSize(BUTTON, BUTTON)
+            if self.t is TEXT['ko'] and key in HELP_KO:      # the long how-to, in Korean
+                tip = HELP_KO[key].format(d=args.wall_clearance,
+                                          r=getattr(args, 'race_clearance', 0.25))
             b.setToolTip(f'<b>{t[key]}</b> ({shortcut})' + (f'<br>{tip}' if tip else ''))
             b.clicked.connect(slot)
             lay.addWidget(b, 0, QtCore.Qt.AlignHCenter)
@@ -422,13 +488,15 @@ class Editor:
             box = QtWidgets.QDoubleSpinBox(minimum=lo, maximum=hi, singleStep=0.25, decimals=2,
                                            value=getattr(args, name))
             box.setFocusPolicy(QtCore.Qt.NoFocus)   # the editor's keys keep working
-            box.setToolTip(t[name + '_tip'])
+            box.setToolTip(HELP_KO[name] if t is TEXT['ko'] else t[name + '_tip'])
             box.valueChanged.connect(lambda v, n=name: self.set_limit(n, v))
             self.win.statusBar().addPermanentWidget(box)
             self.limit_boxes[name] = box
         self.win.statusBar().addPermanentWidget(QtWidgets.QLabel('m/s²'))
         # when the bar is short the help text gives way, not the status (speed range, saved ...)
         help_label = QtWidgets.QLabel(t['help'])
+        if t is TEXT['ko']:
+            help_label.setToolTip(HELP_KO['mouse'])
         help_label.setMinimumWidth(1)
         help_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
         self.win.statusBar().addPermanentWidget(help_label, 1)
@@ -599,8 +667,9 @@ class Editor:
         self.fig.canvas.draw_idle()
 
     def draw_overlays(self, prof):
-        """Full-throttle zones as a thick rainbow line with a black edge, full-brake zones in red
-        and black stripes, the marks on top (a green arrow along the path, a red stop sign)."""
+        """Full-throttle zones as a thick line with a black edge, coloured by speed on the same
+        scale as the speed colours (it used to be a fixed rainbow, which read as slowing down),
+        full-brake zones in red and black stripes, the marks on top (a green arrow, a stop sign)."""
         from matplotlib.collections import LineCollection
         for o in self.overlays:
             o.remove()
@@ -618,9 +687,11 @@ class Editor:
                     edge, = self.ax.plot(seg[:, 0], seg[:, 1], '-', color='black', lw=9,
                                          solid_capstyle='round', zorder=3.2)
                     pieces = np.stack([seg[:-1], seg[1:]], axis=1)
-                    colors = matplotlib.colormaps['hsv'](np.linspace(0.0, 0.85, len(pieces)))
-                    rainbow = LineCollection(pieces, colors=colors, linewidths=6, zorder=3.3,
-                                             capstyle='round')
+                    a = self.args
+                    rainbow = LineCollection(pieces, cmap='turbo', linewidths=6, zorder=3.3,
+                                             capstyle='round',
+                                             norm=matplotlib.colors.Normalize(a.vmin, a.vmax))
+                    rainbow.set_array((v[run][:-1] + v[run][1:]) / 2)
                     self.ax.add_collection(rainbow)
                     top = run[int(np.argmax(v[run]))]
                     label = self.ax.annotate(f'{v[top]:.1f} m/s', px[top], xytext=(8, 8),
@@ -685,7 +756,8 @@ class Editor:
                                f'slow-down {getattr(a, "abrake", a.alon):.2f}, '
                                f'full throttle {getattr(a, "aboost", BOOST_ACCEL):.2f}, '
                                f'full brake {getattr(a, "afull", BRAKE_DECEL):.2f} m/s²')
-        self.win.setWindowTitle(f'waypoint editor — {self.out_name}{" *" if self.dirty else ""}')
+        self.win.setWindowTitle(f'waypoint editor — {self.out_name}{" *" if self.dirty else ""}'
+                                f'  ({t["cap"].format(v=self.args.vmax)})')
         self.fig.canvas.draw_idle()
 
     def snapshot(self):

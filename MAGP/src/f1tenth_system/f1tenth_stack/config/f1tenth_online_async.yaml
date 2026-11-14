@@ -29,7 +29,7 @@ slam_toolbox:
     map_update_interval: 5.0
     resolution: 0.05
     max_laser_range: 20.0 #for rastering images
-    minimum_time_interval: 0.5
+    minimum_time_interval: 0.1  # was 0.5 (2026-11-14): 0.5 s let only ~4 scans into a U-turn, 45 deg apart, past the 20 deg angle search
     transform_timeout: 1.0
     tf_buffer_duration: 30.
     stack_size_to_use: 40000000 #// program needs a larger stack size to serialize large maps
@@ -44,15 +44,15 @@ slam_toolbox:
     scan_buffer_maximum_scan_distance: 10.0
     link_match_minimum_response_fine: 0.1  
     link_scan_maximum_distance: 1.5
-    loop_search_maximum_distance: 4.0  # was 3.0 (2026-11-11): look for the earlier pass this far away
+    loop_search_maximum_distance: 2.0  # was 4.0 (2026-11-14): closed loops onto the neighbouring lane mid-lap
     do_loop_closing: true 
-    loop_match_minimum_chain_size: 5  # was 10 (2026-11-11): close a loop after 5 matching scans (1 m), not 10 (5 m)
+    loop_match_minimum_chain_size: 10  # back from 5 (2026-11-14): a short chain matched the wrong pass
     loop_match_maximum_variance_coarse: 3.0  
     loop_match_minimum_response_coarse: 0.35    
     loop_match_minimum_response_fine: 0.45
 
     # Correlation Parameters - Correlation Parameters
-    correlation_search_space_dimension: 0.8  # was 0.5 (2026-11-11): each scan may correct the pose by up to +-0.4 m
+    correlation_search_space_dimension: 0.5  # back from 0.8 (2026-11-14): with scans every 0.1 s a +-0.4 m window let the pose jump
     correlation_search_space_resolution: 0.01
     correlation_search_space_smear_deviation: 0.1 
 

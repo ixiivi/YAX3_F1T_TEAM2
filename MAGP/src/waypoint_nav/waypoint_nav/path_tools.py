@@ -245,8 +245,9 @@ def race_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake, marks=(), a_boos
     """speed_profile (the track speed) with the driver's marks on top: (speeds, zones).
 
     marks: (waypoint index, BOOST, BRAKE or RESUME), each acting until the next mark:
-      BOOST   speed up at a_boost from the speed there, past curve speeds and vmax (only
-              pure_pursuit's max_speed caps it), until the next mark. Zone BOOST.
+      BOOST   speed up at a_boost from the speed there, past curve speeds, until the next
+              mark, but never above vmax: the car's max_speed caps it too, and the brake after
+              it has to start from the speed the car really reaches. Zone BOOST.
       BRAKE   slow down at a_full until the track speed is reached, then the track speed.
               Zone BRAKE.
       RESUME  back to the track speed: where that is slower, down at a_stop (pure_pursuit's
@@ -260,19 +261,27 @@ def race_profile(xy, closed, vmax, vmin, a_lat, a_lon, a_brake, marks=(), a_boos
         return v, zone
     ds = np.linalg.norm(np.diff(xy, axis=0, append=xy[:1] if closed else xy[-1:]), axis=1)
     marks = sorted({int(i) % n: kind for i, kind in marks}.items())
+    if closed:
+        # start at a full-throttle mark: a zone that runs past the end of the lap into the
+        # first marks must be worked out before the brake after it, which starts from its speed
+        # (otherwise that brake saw the track speed, was skipped, and the speed dropped at once)
+        first = next((k for k, (_, kind) in enumerate(marks) if kind == BOOST), 0)
+        marks = marks[first:] + marks[:first]
     out = v.copy()
     for m, (i, kind) in enumerate(marks):
-        if m + 1 < len(marks):
-            stop = marks[m + 1][0]
+        if m + 1 < len(marks) or closed:
+            stop = marks[(m + 1) % len(marks)][0]
+            if closed and stop <= i:
+                stop += n        # the next mark is past the end of the lap
         else:
-            stop = marks[0][0] + n if closed else n - 1
+            stop = n - 1
         cur = out[i]
         if kind == BOOST or kind == BRAKE and cur > v[i] + 1e-9:   # a brake at track speed: none
             zone[i] = kind
         for step in range(i, stop):
             j, q = step % n, (step + 1) % n
             if kind == BOOST:
-                cur = np.sqrt(cur ** 2 + 2 * a_boost * ds[j])
+                cur = min(np.sqrt(cur ** 2 + 2 * a_boost * ds[j]), max(vmax, cur))
                 zone[q] = BOOST
             else:
                 down = np.sqrt(max(cur ** 2 - 2 * (a_full if kind == BRAKE else a_stop) * ds[j], 0.0))

@@ -52,6 +52,9 @@ vesc_to_odom_node:
     # turn error went from +9.4% to -1.4%. The servo estimate stays as fallback without IMU.
     use_imu_for_yaw: true
     imu_gyro_bias: 2.44        # [deg/s] start value; re-estimated whenever the car stands still
+    # gyro reads about 1.3% low: hand turns of exactly 360 deg gave 357.0, 356.2 and -354.3 deg
+    # (2026-11-11). pi/180 (deg/s -> rad/s) x 1.0133
+    imu_gyro_scale: 0.017686
     # measured 2026-11-03 (stock config said 25 cm)
     wheelbase: 0.33
 
