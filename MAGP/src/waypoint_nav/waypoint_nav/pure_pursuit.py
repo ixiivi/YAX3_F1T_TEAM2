@@ -50,6 +50,7 @@ from scipy.spatial import cKDTree
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan
 from std_msgs.msg import String
+from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker
 
@@ -116,7 +117,7 @@ class PurePursuit(Node):
         p('aeb_half_width', 0.145)   # [m] half car width 0.135 + 1 cm
         p('laser_x', 0.267)          # laser position ahead of base_link [m] (6.3 cm behind front axle)
         p('pose_timeout', 0.5)       # [s]
-        p('accel', 3.5)              # [m/s^2] speed-up limit (the CSV's corner-exit speed-up is 3.0)
+        p('accel', 6.0)              # [m/s^2] speed-up limit; the VESC speed ramp allows ~6 (2026-11-15)
         # [m/s^2] motor-controlled slow-down for space / slower corners. 3.3 on test 2026-11-14: logs
         # show the car itself stops at 3.0-3.4 m/s^2 at most, harder only locks the wheels (was STOP_DECEL 3.0)
         p('stop_decel', 3.3)
@@ -125,7 +126,7 @@ class PurePursuit(Node):
         p('boost_accel', BOOST_ACCEL)  # [m/s^2] speed-up in a full-throttle zone, steering centred
         p('brake_decel', BRAKE_DECEL)  # [m/s^2] slow-down in a full-brake zone
         # in a full-throttle zone this replaces steer_alat (corner exits speed up early); 0 = off
-        p('boost_steer_alat', 4.0)   # [m/s^2]
+        p('boost_steer_alat', 8.0)   # [m/s^2] (rubber floor, 2026-11-15)
         # target the CSV speed this far ahead [s of driving]: speeds up before the faster part
         # and honours any slower point within it early. Off by default: in a lap simulation
         # (2026-11-09) 0.3 s made every corner apex 0.3-0.4 m/s too fast for the CSV's lateral
@@ -171,6 +172,8 @@ class PurePursuit(Node):
         p('aeb_backoff_dist', 0.10)  # [m] each back-off, at least ...
         p('aeb_backoff_max_dist', 0.50)  # [m] ... and on until a forward way is free, at most
         p('aeb_escape', True)        # AEB blocked: creep on with the closest free steering instead
+        p('escape_keep_speed', False) # good pose: keep the current speed on a free escape arc (sim 2026-11-15:
+                                      # it reached the obstacle faster, then braked harder; off until tried)
         p('aeb_escape_speed', 1.2)   # [m/s] escape / follow-the-gap speed while the pose is good ...
         p('aeb_escape_fit', 0.7)     # ... (map fit at least this); otherwise min_speed
         p('aeb_escape_dist', 0.50)   # [m] ... whose path is free at least this far past the bumper
@@ -199,6 +202,12 @@ class PurePursuit(Node):
         # AMCL kept 80 of 99 corrections and the fit never got worse, so it stays on by default
         p('drift_fix_enabled', True)
         p('track_fit', 0.7)
+        # a correction this large is refused while the fit is already ok_fit or more: on the
+        # left1043 spiral a 99 cm fix at fit 72% put the car into the next lane (qualifying 2,
+        # 2026-11-15). Large fixes from a really low fit (3-27%) still go through
+        p('track_max_jump', 0.40)    # [m]
+        p('track_ok_fit', 0.65)      # 0.5 blocked real 40-90 cm fixes at fit 50-56% (normal on
+                                     # left1043 is 0.6-0.65), the drift grew until the pose was lost
         p('track_radius', 0.5)       # [m] search window around the pose at scan time
         p('track_yaw_deg', 15.0)     # [deg]
         # a person or an obstacle in front of the LiDAR drops the fit for a moment while the pose
@@ -222,7 +231,8 @@ class PurePursuit(Node):
         p('changed_area_dist', 3.0)  # [m] driven before low fit counts again
         # the speed the car can turn at with the steering it is about to use: at full lock and
         # 2.95 m/s it slid 1.5 m off the course (2026-11-10). v <= sqrt(steer_alat * radius)
-        p('steer_alat', 4.0)         # [m/s^2] 0 = off
+        # 8 on the rubber floor (2026-11-15): corners peaked at about 8 m/s^2 without sliding
+        p('steer_alat', 8.0)         # [m/s^2] 0 = off
         p('resume_fit', 0.6)         # needed after relocalizing to drive on
         p('accept_fit', 0.75)        # a local re-search result is trusted from this fit on
         # a car or a box in the lane is not on the map, but a pose shifted sideways can lay its
@@ -246,17 +256,30 @@ class PurePursuit(Node):
         # driven since: stopped at a wall it jumped 9-13 m to a wrong place at fit 91-100%
         # (2026-11-14). Out of reach twice in a row: the whole map after all (a real big error)
         p('jump_trust_fit', 0.85)    # a pose with this fit while driving is trusted
+        # the IMU heading survives anything (wheel spin, a hand turn): the heading at the last
+        # trusted pose plus the odom (gyro) turn since. Searches try only headings this close to
+        # it instead of the route direction: with the car turned round by hand the route-
+        # direction search could only find a look-alike place facing forward and the car drove
+        # the lap backwards (2026-11-15). 0 = route direction as before
+        p('imu_heading_tol_deg', 35.0)
+        # first try only this close to where odometry puts the car (trusted pose + odom since):
+        # less than half a lane, so the neighbouring lane of a spiral cannot win on fit alone.
+        # Good enough there (accept_fit): taken. Otherwise the wider searches as before. 0 = off
+        p('odom_first_radius', 0.6)  # [m]
         p('jump_base', 1.0)          # [m] reach around the trusted pose moved on by odom ...
         p('jump_gain', 0.5)          # ... plus this per m driven since, 0 base = off
-        p('jump_free_after', 1)      # searches within reach before the whole map is allowed
+        p('jump_free_after', 3)      # searches within reach before the whole map is allowed (1 -> 3,
+                                     # 2026-11-15: on the left1043 spiral the whole map found look-alike corridors 4-10 m, 90 deg off)
         # while it relocalizes the car keeps rolling into the widest free gap ahead at this speed
         # (AEB still guards the arc): standing 2-24 s per search cost whole laps (2026-11-14).
         # The pose found for the search scan is moved on by the odom since. 0 = stand still
-        p('search_drive_speed', 1.0)  # [m/s]
+        p('search_drive_speed', 0.0)  # [m/s] 0 = stand still (default since 2026-11-15: rolling grew the reach)
         # the last metres of scans, chained by odom, join the relocalization search: one scan at a
         # wall sees one wall that fits anywhere, the corner behind the car fits one place only
-        p('trail_len', 5.0)          # [m] driven distance of scans kept, 0 = off
-        p('trail_step', 0.25)        # [m] one scan kept per this much driving
+        # 10 m (was 5): inner and outer lanes of the left1043 spiral differ in radius, and a longer
+        # curved stretch fits only one of them (relocalizations jumped 1.2-1.6 m to the next lane)
+        p('trail_len', 10.0)         # [m] driven distance of scans kept, 0 = off
+        p('trail_step', 0.4)         # [m] one scan kept per this much driving
         p('trail_points', 150)       # at most this many trail points join a search (search time)
         # driving against the route (a relocalization put the car the wrong way round, or the car
         # really turned): stop and relocalize at once instead of following a route behind it
@@ -272,6 +295,11 @@ class PurePursuit(Node):
         p('reverse_settle_max', 1.0) # [s] reverse after this even if odom still reports motion
         p('search_settle', 0.1)      # [s] the pose search uses a scan at least this much newer
         p('verify_time', 0.3)        # [s] AMCL gets this long with the new pose before the check
+        # ... and up to this long while its pose is not yet where it was put. With update_min_d
+        # 0.20 a standing car got no AMCL update after /initialpose: the check read the old pose,
+        # failed with 5%, and the same good pose was found and rejected again and again
+        # (2026-11-15). So AMCL is also asked for an update without motion while it waits
+        p('verify_max', 1.5)         # [s]
         p('align_gain', 0.6)         # steering per rad of angle to the side wall while reversing
         p('max_attempts', 3)         # recoveries in a row without progress before no more reverse
         p('progress_dist', 1.0)      # [m] driven past the trouble spot for it to count as progress
@@ -333,6 +361,16 @@ class PurePursuit(Node):
         self.car_half_width = gp('car_half_width')
         self.pose_timeout = gp('pose_timeout')
         self.accel, self.stop_decel = gp('accel'), gp('stop_decel')
+        # the panel changes accel while driving (ros2 param set): keep self.accel in step
+        from rclpy.parameter import Parameter
+        from rcl_interfaces.msg import SetParametersResult
+
+        def on_params(params):
+            for prm in params:
+                if prm.name == 'accel' and prm.type_ in (Parameter.Type.DOUBLE, Parameter.Type.INTEGER):
+                    self.accel = float(prm.value)
+            return SetParametersResult(successful=True)
+        self.add_on_set_parameters_callback(on_params)
         self.dt = 1.0 / gp('rate')
 
         self.matcher = None
@@ -363,12 +401,17 @@ class PurePursuit(Node):
         self.target_pub = self.create_publisher(Marker, '/pure_pursuit/target', 10)
         self.avoid_pub = self.create_publisher(Path, '/pure_pursuit/avoid_path', 10)
         self.pose_pub = self.create_publisher(PoseWithCovarianceStamped, '/initialpose', 10)
+        # AMCL updates only after update_min_d / update_min_a of motion; this asks it for one now
+        self.nomotion_cli = self.create_client(Empty, '/request_nomotion_update')
+        self.nudged_at = 0.0
+        self.reloc_put = None             # (map pose put into AMCL, odom then) for the check
         self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
         # for the run log only: measured speed and accelerations, to compare with the plan
         self.odom_v = self.imu = None
         self.odom_w = 0.0
         self.odom_path, self.odom_last = 0.0, None   # [m] distance driven (odom), last odom xy
         self.trust, self.far_cuts = None, 0           # (map pose, odom pose, odom_path) / count
+        self.search_yaw = None                        # IMU-predicted heading for the search
         self.scan_trail = deque()                          # (odom_path, Nx2 odom-frame points)
         self.wrong_since, self.wrong_hold = None, 0.0  # odom_path until which it is not judged
         self.search_guess = self.quiet_from = None
@@ -935,9 +978,18 @@ class PurePursuit(Node):
             alt = self.escape_steer(steer, reach)
             self.aeb_hit_pts = hit_pts
             if alt is not None:
-                self.speed_cmd = min(self.speed_cmd, v_esc) if self.speed_cmd > v_esc else self.ramp(v_esc)
+                # the free arc was checked for the stopping distance of the current speed: with a
+                # good pose keep that speed (only what the new steering can turn at), do not drop
+                # to the escape speed. Dropping to 1.2 m/s at every obstacle on a straight and
+                # speeding up again cost most of the straights (2026-11-15: 4.2 planned, 2.1 run)
+                keep = min(self.speed_cmd, self.turn_speed(alt))
+                if self.gp('escape_keep_speed') and v_esc > self.min_speed and keep > v_esc:
+                    self.speed_cmd = keep
+                    self.v_limit = 'escape:keep'
+                else:
+                    self.speed_cmd = min(self.speed_cmd, v_esc) if self.speed_cmd > v_esc else self.ramp(v_esc)
+                    self.v_limit = 'escape'
                 v = self.floor(self.speed_cmd, alt)
-                self.v_limit = 'escape'
                 self.status = (f'AEB escape: st {alt:+.2f} instead of {steer:+.2f} '
                                f'(blocked {hit - self.car_front:.2f} m ahead)')
                 self.drive(v, alt)
@@ -1198,6 +1250,12 @@ class PurePursuit(Node):
         if gen != self.track_gen or fit < self.gp('accept_fit') or self.fit is None \
                 or fit <= self.fit:
             return
+        if (math.hypot(bx - sx, by - sy) > self.gp('track_max_jump')
+                and self.fit >= self.gp('track_ok_fit')):
+            self.get_logger().info(
+                f'drift fix refused: {math.hypot(bx - sx, by - sy) * 100:.0f} cm with the fit '
+                f'already {self.fit * 100:.0f}% (look-alike lane?)')
+            return
         # the search used an older scan: move the pose now by the same correction
         dyaw = math.atan2(math.sin(byaw - syaw), math.cos(byaw - syaw))
         c, s = math.cos(dyaw), math.sin(dyaw)
@@ -1207,6 +1265,7 @@ class PurePursuit(Node):
         msg.pose.covariance[0] = msg.pose.covariance[7] = 0.01
         msg.pose.covariance[35] = 0.005
         self.pose_pub.publish(msg)
+        self.nudge_amcl(force=True)       # a slow or standing car would not update AMCL otherwise
         self.corrections += 1
         self.last_fix = (math.hypot(bx - sx, by - sy) * 100.0, math.degrees(dyaw))
         self.low_since = None
@@ -1429,6 +1488,7 @@ class PurePursuit(Node):
             guess = self.lookup('map', stamp) or pose
             self.search_guess = guess
             self.search_odom = self.lookup('odom', stamp)
+            self.search_yaw = self.predicted_yaw(self.search_odom)
             threading.Thread(target=self._search, args=(scan, guess, self.lost_idx,
                                                         self.reach(), self.trail_rays(scan)),
                              daemon=True).start()
@@ -1448,7 +1508,11 @@ class PurePursuit(Node):
         x, y, yaw = self.carry_on(x, y, yaw, self.search_odom)
         for _ in range(2):
             self.pose_pub.publish(initial_pose_msg(self, x, y, yaw))
-        self.mode, self.verify_at = 'verify', time.monotonic() + self.gp('verify_time')
+        self.reloc_put = ((x, y, yaw), self.lookup('odom'))
+        self.nudge_amcl(force=True)
+        now = time.monotonic()
+        self.mode, self.verify_at = 'verify', now + self.gp('verify_time')
+        self.verify_until = now + self.gp('verify_max')
         self.status = f'relocalized ({x:.2f}, {y:.2f}), checking...'
 
     def carry_on(self, x, y, yaw, then):
@@ -1520,6 +1584,15 @@ class PurePursuit(Node):
         self.wrong_since, self.wrong_hold = None, self.odom_path + 3.0
         return True
 
+    def predicted_yaw(self, odom):
+        """Map heading of the car from the last trusted pose and the odom (IMU) turn since,
+        or None (nothing trusted yet, no odom, or switched off)."""
+        if self.trust is None or odom is None or self.gp('imu_heading_tol_deg') <= 0.0:
+            return None
+        (_, _, myaw), (_, _, oyaw), _ = self.trust
+        y = myaw + odom[2] - oyaw
+        return math.atan2(math.sin(y), math.cos(y))
+
     def reach(self):
         """(x, y, yaw, radius): the trusted pose carried on by odom and how far the car can be
         from it now, or None (nothing trusted, limit off, or cut back often enough already)."""
@@ -1548,14 +1621,30 @@ class PurePursuit(Node):
         both = lambda res: self.matcher.fit(*res[1:], rs, as_)  # noqa: E731
         ok = lambda res: self.matcher.fit(*res[1:], r, a) >= self.gp('accept_fit')  # noqa: E731
         near = None
+        rad0 = self.gp('odom_first_radius') or 0.0
+        if limit is not None and rad0 > 0.0:
+            first = self.matcher.local_search(limit[0], limit[1], limit[2], rs, as_,
+                                              radius=min(rad0, limit[3]), yaw_range_deg=20.0)
+            # the search's fine steps can wander ~0.6 m past its radius (results came 93-102 cm
+            # from the odometry pose, as far as the next lane): only an answer inside counts
+            inside0 = math.hypot(first[1] - limit[0], first[2] - limit[1]) <= rad0 + 0.05
+            if ok(first) and inside0:
+                self.get_logger().info(
+                    f'relocalize: where odometry puts the car ({self.matcher.fit(*first[1:], r, a) * 100:.0f}%, '
+                    f'{math.hypot(first[1] - limit[0], first[2] - limit[1]) * 100:.0f} cm from it)')
+                fit = self.matcher.fit(*first[1:], r, a)
+                self.search_result = (fit,) + tuple(first[1:])
+                return
         if guess is not None:
             # near the (wrong) estimate first: quick, and right when AMCL only slipped a bit.
             # Judge it by the strict fit, the soft score also likes wrong places nearby
             near = self.matcher.local_search(*guess, rs, as_)
             rad = self.gp('route_prior_dist')
-            if lost_idx is not None and rad > 0.0:
-                k = int(lost_idx) % len(self.xy)
-                h = float(self.route_heading(self.xy[k:k + 1, 0], self.xy[k:k + 1, 1])[0])
+            k = int(lost_idx) % len(self.xy) if lost_idx is not None else 0
+            h = float(self.route_heading(self.xy[k:k + 1, 0], self.xy[k:k + 1, 1])[0])
+            yaw_now = getattr(self, 'search_yaw', None)
+            facing = yaw_now is None or abs(math.remainder(h - yaw_now, 2 * math.pi)) < math.radians(60)
+            if lost_idx is not None and rad > 0.0 and facing:     # only if the car faces the route
                 along = self.matcher.local_search(self.xy[k, 0], self.xy[k, 1], h, rs, as_,
                                                   radius=rad, yaw_range_deg=30.0)
                 fa, fn = both(along), both(near)
@@ -1596,8 +1685,16 @@ class PurePursuit(Node):
             if tol > 0.0:
                 # the car points along the route almost always: 14 s -> ~3 s (2026-11-14,
                 # the car stood 14 s on the track at the venue). Not found: everything
-                res = self.matcher.global_search(r6, a6, heading_of=self.route_heading,
-                                                 tol_deg=tol)
+                yaw_now = getattr(self, 'search_yaw', None)
+                if yaw_now is not None:
+                    imu_tol = self.gp('imu_heading_tol_deg')
+                    res = self.matcher.global_search(
+                        r6, a6, heading_of=lambda xs, ys: np.full(len(xs), yaw_now), tol_deg=imu_tol)
+                    self.get_logger().info(f'relocalize: whole map at the IMU heading '
+                                           f'{math.degrees(yaw_now):.0f} +-{imu_tol:.0f} deg')
+                else:
+                    res = self.matcher.global_search(r6, a6, heading_of=self.route_heading,
+                                                     tol_deg=tol)
                 if self.matcher.fit(*res[1:], r, a) < self.gp('resume_fit'):
                     self.get_logger().info('relocalize: nothing along the route, full search')
                     res = None
@@ -1649,9 +1746,28 @@ class PurePursuit(Node):
         self.quiet_from = None
         return False
 
+    def nudge_amcl(self, force=False):
+        """Ask AMCL for an update without motion (at most every 0.1 s)."""
+        now = time.monotonic()
+        if (force or now - self.nudged_at > 0.1) and self.nomotion_cli.service_is_ready():
+            self.nomotion_cli.call_async(Empty.Request())
+            self.nudged_at = now
+
+    def amcl_took_it(self, pose):
+        """AMCL's pose is where the relocalization put it (carried on by odom since)."""
+        if self.reloc_put is None or pose is None:
+            return True
+        put, odom_then = self.reloc_put
+        return self.same_pose(self.carry_on(*put, odom_then), pose)
+
     def step_verify(self, pose):
         self.creep()
-        if time.monotonic() < self.verify_at or pose is None:
+        self.nudge_amcl()
+        now = time.monotonic()
+        if now < self.verify_at or pose is None:
+            return
+        if not self.amcl_took_it(pose) and now < getattr(self, 'verify_until', 0.0):
+            self.status = 'relocalized, waiting for AMCL to take the pose...'
             return
         fit = self.matcher.fit(*pose, *self.rays(self.scan, 3))
         if fit >= self.gp('resume_fit'):

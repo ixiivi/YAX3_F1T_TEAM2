@@ -57,7 +57,7 @@ from waypoint_nav.path_tools import (BOOST, BOOST_ACCEL, BRAKE, BRAKE_DECEL, RES
                                      speed_profile, wall_margins, write_csv)
 
 WP_DIR = os.path.expanduser('~/MAGP/MAGP/waypoints')
-LIMIT_DEFAULTS = {'alat': 2.0, 'alon': 3.0}   # used until a route is saved with other values
+LIMIT_DEFAULTS = {'alat': 2.0, 'alon': 6.0}   # used until a route is saved with other values
 
 
 def settings():
@@ -483,7 +483,7 @@ class Editor:
         self.win.statusBar().addWidget(self.status, 1)
         # lateral grip and speed-up: change them and watch the speed colours, then save
         self.limit_boxes = {}
-        for name, label, lo, hi in (('alat', t['alat'], 1.0, 8.0), ('alon', t['alon'], 0.5, 8.0)):
+        for name, label, lo, hi in (('alat', t['alat'], 1.0, 12.0), ('alon', t['alon'], 0.5, 8.0)):
             self.win.statusBar().addPermanentWidget(QtWidgets.QLabel(label))
             box = QtWidgets.QDoubleSpinBox(minimum=lo, maximum=hi, singleStep=0.25, decimals=2,
                                            value=getattr(args, name))

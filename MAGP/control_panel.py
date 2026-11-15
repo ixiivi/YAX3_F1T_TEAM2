@@ -750,7 +750,7 @@ class Panel(QtWidgets.QWidget):
         self.reverse_cb = QtWidgets.QCheckBox('벽에 박으면 후진', checked=True)
         self.reverse_cb.setToolTip('앞바퀴나 범퍼가 벽에 닿으면 지나온 길로 후진해요.\n'
                                    '끄면 충돌 감지도 꺼져요. 위치가 틀어지면 후진 없이 제자리에서 다시 잡아요.')
-        self.search_drive_cb = QtWidgets.QCheckBox('위치 찾는 동안 계속 주행', checked=True)
+        self.search_drive_cb = QtWidgets.QCheckBox('위치 찾는 동안 계속 주행', checked=False)
         self.search_drive_cb.setToolTip('위치를 다시 찾는 동안 멈추지 않고 라이다로 본 가장 넓은 빈 곳 쪽으로\n'
                                         '천천히 굴러가요 (AEB는 그대로). 끄면 예전처럼 서서 찾아요.')
         self.search_speed = QtWidgets.QDoubleSpinBox(minimum=0.5, maximum=2.0, singleStep=0.1,
@@ -759,30 +759,51 @@ class Panel(QtWidgets.QWidget):
         self.drift_cb = QtWidgets.QCheckBox('주행 중 위치 보정 (drift fix)', checked=True)
         self.drift_cb.setToolTip('맵 일치도가 낮으면 근처를 스캔 매칭으로 찾아 AMCL을 바로잡아요.\n'
                                  '끄면 AMCL만 써요. 위치를 잃었을 때 다시 찾는 기능은 그대로예요.')
+        # speed limits of the driving code itself (on top of the route CSV's own speeds)
+        # 2026-11-15 on the rubber floor: corners were limited by speed-up 26% of the time, the
+        # steering cap only 2%; the VESC speed ramp (28000 ERPM/s) allows about 6 m/s^2
+        # both start at their maximum (user's choice, 2026-11-15): lower them in the box when needed
+        self.accel_sb = QtWidgets.QDoubleSpinBox(minimum=2.0, maximum=7.0, singleStep=0.25,
+                                                 value=7.0, suffix=' m/s²')
+        self.accel_sb.setToolTip('가속 상한. 경로 파일 가속이 이보다 커도 여기서 잘려요 (기본 7.0 = 최대).\n'
+                                 '너무 높으면 출발할 때 바퀴가 헛돌아요.')
+        self.alat_sb = QtWidgets.QDoubleSpinBox(minimum=2.0, maximum=12.0, singleStep=0.25,
+                                                value=12.0, suffix=' m/s²')
+        self.alat_sb.setToolTip('코너 상한 (조향으로 본 횡가속). 경로 파일 코너 속도가 이보다 빨라도\n'
+                                '여기서 잘려요 (기본 12.0 = 최대, 고무 바닥 기준). 너무 높으면 코너에서 바깥으로 밀려요.')
+        self.keep_cb = QtWidgets.QCheckBox('피할 때 속도 유지 (시험 중)', checked=False)
+        self.keep_cb.setToolTip('빈 쪽으로 피할 때 1.2 m/s로 줄이지 않고 지금 속도를 유지해요.\n'
+                                '시뮬에서는 더 느렸어요 (장애물에 더 빨리 다가가서 더 세게 다시 줄임).')
         self.gpu_cb = QtWidgets.QCheckBox('위치 탐색에 GPU 사용', checked=False)
         self.gpu_cb.setToolTip('위치를 다시 찾을 때 후보 위치 계산을 GPU로 해요 (CPU와 같은 결과, 3~4배 빠름).\n'
                                '자율주행 준비 / 위치 찾기를 다시 켤 때 적용돼요.')
-        self.amcl_light_cb = QtWidgets.QCheckBox('AMCL 가볍게 (입자 1000, 레이저 90)', checked=False)
-        self.amcl_light_cb.setToolTip('AMCL 계산량을 줄여요 (기본: 입자 2000, 레이저 180).\n'
+        self.amcl_light_cb = QtWidgets.QCheckBox('AMCL 가볍게 (입자 1000, 레이저 60, 20 cm마다)', checked=True)
+        self.amcl_light_cb.setToolTip('AMCL 계산량을 줄여요 (끄면: 입자 2000, 레이저 180, 2.5 cm마다).\n'
                                       '위치 추정(AMCL)을 다시 켤 때 적용돼요.')
         rows = [(self.avoid_cb, None), (self.reverse_cb, None),
                 (self.search_drive_cb, self.search_speed), (self.drift_cb, None),
-                (self.gpu_cb, None), (self.amcl_light_cb, None)]
+                (self.keep_cb, None), (self.gpu_cb, None), (self.amcl_light_cb, None),
+                (QtWidgets.QLabel('가속 상한'), self.accel_sb),
+                (QtWidgets.QLabel('코너 상한 (횡가속)'), self.alat_sb)]
         for r, (w, extra) in enumerate(rows):
             lay.addWidget(w, r, 0, 1, 1 if extra else 2)
             if extra:
                 lay.addWidget(extra, r, 1)
-        note = QtWidgets.QLabel('위 네 가지는 주행 중에도 바로 적용돼요.\n'
-                                'GPU는 자율주행을, AMCL 가볍게는 위치 추정을 다시 켤 때 적용돼요.')
+        note = QtWidgets.QLabel('GPU는 자율주행을, AMCL 가볍게는 위치 추정을 다시 켤 때 적용돼요.\n'
+                                '나머지는 주행 중에도 바로 적용돼요.')
         note.setStyleSheet('color: gray')
         lay.addWidget(note, len(rows), 0, 1, 2)
         close = QtWidgets.QPushButton('닫기')
         close.clicked.connect(dlg.hide)
         lay.addWidget(close, len(rows) + 1, 1)
         for cb, name in ((self.avoid_cb, 'avoid_enabled'), (self.reverse_cb, 'reverse_enabled'),
-                         (self.drift_cb, 'drift_fix_enabled')):
+                         (self.drift_cb, 'drift_fix_enabled'), (self.keep_cb, 'escape_keep_speed')):
             cb.toggled.connect(lambda on, n=name, c=cb: self.set_pp_param(n, 'true' if on else 'false',
                                                                           c.text()))
+        self.accel_sb.valueChanged.connect(
+            lambda v: self.set_pp_param('accel', f'{v:.2f}', '가속 상한'))
+        self.alat_sb.valueChanged.connect(
+            lambda v: self.set_pp_param('steer_alat', f'{v:.2f}', '코너 상한'))
         self.search_drive_cb.toggled.connect(self.apply_search_drive)
         self.search_speed.valueChanged.connect(self.apply_search_drive)
         self.amcl_light_cb.toggled.connect(lambda on: self.event_label.setText(
@@ -851,7 +872,9 @@ class Panel(QtWidgets.QWidget):
                    f'-p reverse_enabled:={str(self.reverse_cb.isChecked()).lower()} '
                    f'-p search_drive_speed:={self.search_drive_value():.2f} '
                    f'-p drift_fix_enabled:={str(self.drift_cb.isChecked()).lower()} '
-                   f'-p match_device:={self.match_device()}'),
+                   f'-p match_device:={self.match_device()} '
+                   f'-p accel:={self.accel_sb.value():.2f} -p steer_alat:={self.alat_sb.value():.2f} '
+                   f'-p escape_keep_speed:={str(self.keep_cb.isChecked()).lower()}'),
         }
         if key == 'localize':
             self.loc_map = self.selected_map()

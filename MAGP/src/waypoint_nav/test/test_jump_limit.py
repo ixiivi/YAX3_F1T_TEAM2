@@ -12,7 +12,8 @@ from test_obstacle_filter import lobby, poses  # noqa: F401
 def prepare(pp):
     pp.params.update({'accept_fit': 0.75, 'route_prior_dist': 0.0, 'global_heading_tol_deg': 0.0,
                       'resume_fit': 0.6, 'global_min_gain': 0.10, 'jump_free_after': 2,
-                      'jump_base': 1.0, 'jump_gain': 0.5, 'match_obstacle_margin': 0.0})
+                      'jump_base': 1.0, 'jump_gain': 0.5, 'match_obstacle_margin': 0.0,
+                      'odom_first_radius': 0.6})
     pp.far_cuts = 0
     pp.get_logger = lambda: SimpleNamespace(info=lambda *_: None)
 
@@ -58,3 +59,16 @@ def test_a_far_answer_is_cut_back_to_the_reach(lobby):
     PurePursuit._search(pp, scan, guess, limit=(x + 0.5, y, yaw, 1.5))
     assert math.hypot(pp.search_result[1] - x, pp.search_result[2] - y) < 0.3
     assert pp.far_cuts == 0
+
+
+def test_odometry_first_keeps_the_car_in_its_lane(lobby):
+    # the reach centre (trusted pose + odom) is 0.3 m off the car: the odometry-first search finds
+    # the car there and never looks further (a look-alike lane 1.2 m away cannot win)
+    from waypoint_nav.pure_pursuit import PurePursuit
+    pp = lobby
+    prepare(pp)
+    i, x, y, yaw = next(poses(pp))
+    place(pp, (x, y, yaw), None)
+    PurePursuit._search(pp, None, (x + 1.2, y, yaw), limit=(x + 0.3, y, yaw, 2.5))
+    res = pp.search_result
+    assert math.hypot(res[1] - x, res[2] - y) < 0.3 and pp.far_cuts == 0
